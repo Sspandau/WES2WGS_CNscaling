@@ -31,10 +31,12 @@ def run_mosdepth(bam_path, bed_path, output_prefix, threads=4):
     subprocess.run(cmd, check=True)
 
 def parse_mosdepth_regions(output_prefix):
-    """Parses compressed mosdepth region output into a clean DataFrame."""
     regions_file = f"{output_prefix}.regions.bed.gz"
-    df = pd.read_csv(regions_file, sep='\t', compression='gzip', 
-                     header=None, names=['chrom', 'start', 'end', 'depth'])
+    df = pd.read_csv(regions_file, sep='\t', compression='gzip',
+                     header=None, names=['chrom', 'start', 'end', 'name', 'depth'])
+    df['chrom'] = df['chrom'].astype(str)
+    df['start'] = df['start'].astype(int)
+    df['end'] = df['end'].astype(int)
     return df
 
 def compute_gc_content(windows_bed_path, reference_fasta_path):
@@ -171,14 +173,8 @@ def main():
         sample_depths_df = parse_mosdepth_regions(output_prefix)
         
         if window_coordinates_df is None:
-            window_coordinates_df = sample_depths_df[['chrom', 'start', 'end']].copy()
-            print(window_coordinates_df.dtypes)
-            print(window_coordinates_df.head())
-            window_coordinates_df['window_id'] = (
-                window_coordinates_df['chrom'] + ":" + 
-                window_coordinates_df['start'].astype(str) + "-" + 
-                window_coordinates_df['end'].astype(str)
-            )
+            window_coordinates_df = sample_depths_df[['chrom', 'start', 'end', 'name']].copy()
+            window_coordinates_df = window_coordinates_df.rename(columns={'name': 'window_id'})
 
         depth_matrix_dict[sample_name] = sample_depths_df['depth'].values
 
