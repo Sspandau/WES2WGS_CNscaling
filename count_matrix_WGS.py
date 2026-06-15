@@ -53,7 +53,8 @@ def compute_gc_content(windows_bed_path, reference_fasta_path):
     df_nuc = nuc_bed.to_dataframe(header=None)
     
     # Extract the %GC column (index 5)
-    gc_series = df_nuc[5].astype(float)
+    gc_series = df_nuc[5]
+    gc_series = gc_series[gc_series != '6_pct_gc'].astype(float).reset_index(drop=True)
     return gc_series
 
 def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
