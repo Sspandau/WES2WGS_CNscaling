@@ -53,7 +53,7 @@ def main():
 
     # 1. GENERATE INITIAL WINDOWS WITHIN ACCESSIBLE REGIONS
     print(f"[+] Creating {WINDOW_SIZE/1000:.1f}kb windows inside accessible regions...")
-    windows = pybedtools.BedTool.makewindows(b=ACCESS_BED_PATH, w=WINDOW_SIZE)
+    windows = pybedtools.BedTool(ACCESS_BED_PATH).makewindows(b=ACCESS_BED_PATH, w=WINDOW_SIZE)
     print(f"    -> Generated initial accessible windows: {windows.count()}")
 
 
