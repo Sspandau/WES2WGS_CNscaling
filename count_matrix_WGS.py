@@ -172,6 +172,8 @@ def main():
         
         if window_coordinates_df is None:
             window_coordinates_df = sample_depths_df[['chrom', 'start', 'end']].copy()
+            print(window_coordinates_df.dtypes)
+            print(window_coordinates_df.head())
             window_coordinates_df['window_id'] = (
                 window_coordinates_df['chrom'] + ":" + 
                 window_coordinates_df['start'].astype(str) + "-" + 
