@@ -31,6 +31,9 @@ def run_mosdepth(bam_path, bed_path, output_prefix, threads=4):
     subprocess.run(cmd, check=True)
 
 def parse_mosdepth_regions(output_prefix):
+    """Parses compressed mosdepth region output into a clean DataFrame.
+    mosdepth outputs 5 columns when given a named BED: chrom, start, end, name, depth.
+    """
     regions_file = f"{output_prefix}.regions.bed.gz"
     df = pd.read_csv(regions_file, sep='\t', compression='gzip',
                      header=None, names=['chrom', 'start', 'end', 'name', 'depth'])
@@ -54,7 +57,7 @@ def compute_gc_content(windows_bed_path, reference_fasta_path):
     # For a 4-column input BED (chrom, start, end, name), column 5 is %AT and column 6 is %GC
     df_nuc = nuc_bed.to_dataframe(header=None)
     
-    # Extract the %GC column (index 5)
+    # Extract the %GC column (index 5), dropping the header row if present
     gc_series = df_nuc[5]
     gc_series = gc_series[gc_series != '6_pct_gc'].astype(float).reset_index(drop=True)
     return gc_series
@@ -64,14 +67,16 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
     Fits a LOESS curve of normalized_depth ~ GC% using autosomal windows,
     then predicts and normalizes across all genomic windows.
     """
-    # Create clean training vectors strictly from valid autosomal windows
-    # Reject windows with zero depth or NaN/inf errors to protect regression stability
-    print(f"    -> Debug: depth_series length={len(depth_series)}, gc_series length={len(gc_series)}, autosome_indices length={len(autosome_indices)}")
-    valid_mask = autosome_indices & (depth_series > 0) & (~np.isnan(gc_series)) & (~np.isnan(depth_series))
-    print(f"    -> Debug: valid autosomal windows after masking={valid_mask.sum()}")
+    # Use .values to strip pandas indices and force pure numpy boolean operations,
+    # preventing index misalignment when combining numpy array (autosome_indices)
+    # with pandas Series (depth_series, gc_series)
+    valid_mask = (autosome_indices &
+                  (depth_series.values > 0) &
+                  (~np.isnan(gc_series.values)) &
+                  (~np.isnan(depth_series.values)))
 
-    train_gc = gc_series[valid_mask].values
-    train_depth = depth_series[valid_mask].values
+    train_gc = gc_series.values[valid_mask]
+    train_depth = depth_series.values[valid_mask]
     
     if len(train_gc) < 10:
         print("    [!] Error: Too few valid autosomal windows to safely fit LOESS model.")
@@ -120,7 +125,6 @@ def main():
                    help="Temp directory")
     p.add_argument("-t", metavar="INT", type=int,
                    default=4, help="Threads per bam")
-    
     
     args = p.parse_args()
 
@@ -175,6 +179,7 @@ def main():
         sample_depths_df = parse_mosdepth_regions(output_prefix)
         
         if window_coordinates_df is None:
+            # Use the name column already built by define_genome_windows.py
             window_coordinates_df = sample_depths_df[['chrom', 'start', 'end', 'name']].copy()
             window_coordinates_df = window_coordinates_df.rename(columns={'name': 'window_id'})
 
