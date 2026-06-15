@@ -66,8 +66,10 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
     """
     # Create clean training vectors strictly from valid autosomal windows
     # Reject windows with zero depth or NaN/inf errors to protect regression stability
+    print(f"    -> Debug: depth_series length={len(depth_series)}, gc_series length={len(gc_series)}, autosome_indices length={len(autosome_indices)}")
     valid_mask = autosome_indices & (depth_series > 0) & (~np.isnan(gc_series)) & (~np.isnan(depth_series))
-    
+    print(f"    -> Debug: valid autosomal windows after masking={valid_mask.sum()}")
+
     train_gc = gc_series[valid_mask].values
     train_depth = depth_series[valid_mask].values
     
