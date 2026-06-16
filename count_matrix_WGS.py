@@ -52,6 +52,7 @@ def compute_gc_content(windows_bed_path, reference_fasta_path):
     
     # Run bedtools nuc
     nuc_bed = windows_bed.nucleotide_content(fi=reference_fasta_path)
+    print(nuc_bed.head())
     
     # bedtools nuc appends calculation tracking columns to the end of the original BED file
     # For a 4-column input BED (chrom, start, end, name), column 5 is %AT and column 6 is %GC
