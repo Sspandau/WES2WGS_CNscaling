@@ -200,7 +200,13 @@ def main():
         flag_zero_wes = (raw_wes_depth == 0).astype(int)
 
         # Filter 3: Extreme scaling values (implausible CN — likely mapping artifact)
-        flag_extreme_scaling = ((depth_scaled > 20.0) | (depth_scaled < 0.05)).astype(int)
+        #flag_extreme_scaling = ((depth_scaled > 20.0) | (depth_scaled < 0.05)).astype(int)
+
+        # Filter 3 v2: just protecting against PoN near-zero division instability:
+        flag_unstable_pon = (pon_median < 0.01).astype(int)
+                # And keep only a very conservative high-end cap for genuine numerical instability:
+        flag_numerical_instability = (depth_scaled > 1000).astype(int)
+        flag_extreme_scaling = (flag_unstable_pon | flag_numerical_instability).astype(int)
 
         # Filter 4: Pre-flagged high-variance PoN windows from Step 4
         flag_pon_variance = df_pon['is_high_variance'].values
