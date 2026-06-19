@@ -220,15 +220,12 @@ def main():
 
     final_output_df = window_coordinates_df[['chrom', 'start', 'end']].copy()
     final_output_df['gc_pct'] = gc_content_series.values
-    final_output_df = final_output_df.join(matrix_W)
-    
-    print(f"    -> Debug: final_output_df index type: {final_output_df.index[:3].tolist()}")
-    print(f"    -> Debug: matrix_W index type: {matrix_W.index[:3].tolist()}")
-    print(f"    -> Debug: matrix_W head:\n{matrix_W.head()}")
-    print(f"    -> Debug: final_output_df head before join:\n{final_output_df.head()}")
-    print(f"    -> Debug: final_output_df head after join:\n{final_output_df.join(matrix_W).head()}")
+    final_output_df.index = matrix_W.index  # align to window_id strings before joining
+
+    final_output_df = pd.concat([final_output_df, matrix_W], axis=1)
+
     final_output_df.to_csv(MATRIX_OUTPUT_TSV, sep='\t', index=True)
-    
+
     print("\n" + "="*60)
     print(f"[+] STEP 2 & 3 SUCCESSFUL!")
     print(f"    -> GC-Corrected Matrix shape: {matrix_W.shape} (Windows x Samples)")
