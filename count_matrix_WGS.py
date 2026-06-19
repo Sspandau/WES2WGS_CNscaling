@@ -13,21 +13,18 @@ To add:
 log file instead of print statements
 '''
 
-def run_mosdepth(bam_path, bed_path, output_prefix, threads=4):
-    """
-    Executes mosdepth to calculate read counts across targeted BED windows.
-    Filters: MAPQ >= 20, excludes duplicates, secondary, and supplementary alignments.
-    """
+def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, reference_fasta=None):
     cmd = [
         "mosdepth",
         "--threads", str(threads),
         "--by", bed_path,
         "--mapq", "20",
-        "--flag", "3844",  # Excludes duplicates (1024), supplementary (2048), non-primary (256), QC-fail (512)
+        "--flag", "3844",
         "--no-per-base",
-        output_prefix,
-        bam_path
     ]
+    if reference_fasta is not None:
+        cmd += ["--fasta", reference_fasta]
+    cmd += [output_prefix, bam_path]
     subprocess.run(cmd, check=True)
 
 def parse_mosdepth_regions(output_prefix):
@@ -137,7 +134,8 @@ def main():
     
     # Directory containing your control/normal WGS BAM files
     WGS_BAM_DIR = args.wgs_bams_dir
-    BAM_PATTERN = os.path.join(WGS_BAM_DIR, "*.bam")
+    BAM_PATTERN_BAM  = os.path.join(WGS_BAM_DIR, "*.bam")
+    BAM_PATTERN_CRAM = os.path.join(WGS_BAM_DIR, "*.cram")
     
     # Processing settings
     THREADS_PER_BAM = args.t
@@ -152,7 +150,7 @@ def main():
 
     # 2. FILE VERIFICATION & GC RUN
 
-    bam_files = glob.glob(BAM_PATTERN)
+    bam_files = glob.glob(BAM_PATTERN_BAM) + glob.glob(BAM_PATTERN_CRAM)
     if not bam_files:
         print(f"[-] Error: No BAM files found matching pattern: {BAM_PATTERN}")
         return
@@ -176,7 +174,7 @@ def main():
         print(f"\n[+] Processing Sample: {sample_name}")
         
         output_prefix = os.path.join(TMP_DIR, f"{sample_name}_mosdepth")
-        run_mosdepth(bam_path, WINDOWS_BED, output_prefix, threads=THREADS_PER_BAM)
+        run_mosdepth(bam_path, WINDOWS_BED, output_prefix, threads=THREADS_PER_BAM, reference_fasta=REF_FASTA)
         sample_depths_df = parse_mosdepth_regions(output_prefix)
         
         if window_coordinates_df is None:
@@ -224,6 +222,11 @@ def main():
     final_output_df['gc_pct'] = gc_content_series.values
     final_output_df = final_output_df.join(matrix_W)
     
+    print(f"    -> Debug: final_output_df index type: {final_output_df.index[:3].tolist()}")
+    print(f"    -> Debug: matrix_W index type: {matrix_W.index[:3].tolist()}")
+    print(f"    -> Debug: matrix_W head:\n{matrix_W.head()}")
+    print(f"    -> Debug: final_output_df head before join:\n{final_output_df.head()}")
+    print(f"    -> Debug: final_output_df head after join:\n{final_output_df.join(matrix_W).head()}")
     final_output_df.to_csv(MATRIX_OUTPUT_TSV, sep='\t', index=True)
     
     print("\n" + "="*60)
