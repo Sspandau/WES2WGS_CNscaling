@@ -209,9 +209,36 @@ def main():
 
         df_output = df_pon[['chrom', 'start', 'end', 'gc_pct']].copy()
         df_output['raw_wes_depth']      = raw_wes_depth
-        df_output['pon_median_wgs']     = pon_median
+        df_output['pon_median_wgs']     = pon_median # This is now the true raw WGS window depth!
         df_output['depth_scaled_ratio'] = depth_scaled
         df_output['pon_cv']             = pon_cv
+
+        # ----------------------------------------------------
+        # NEW CALCULATION: PREDICTED UPSCALED DEPTH
+        # ----------------------------------------------------
+        # Multiplier = 1 / depth_scaled_ratio
+        # Predicted = raw_wes_depth * (1 / depth_scaled_ratio)
+        # Handle zero division safely for masked bins
+        safe_ratio = np.where(depth_scaled <= 1e-4, 1e-4, depth_scaled)
+        df_output['predicted_upscale_depth'] = raw_wes_depth / safe_ratio
+
+        # Cap it to your maximum allowed scaling constraint (200x) just like the BAM script
+        max_theoretical_depth = pon_median * 200.0
+        df_output['predicted_upscale_depth'] = np.minimum(df_output['predicted_upscale_depth'], max_theoretical_depth)
+
+        # Quality flags
+        df_output['flag_high_cv']         = flag_high_cv
+        df_output['flag_zero_wes']        = flag_zero_wes
+        df_output['flag_extreme_scaling'] = flag_extreme_scaling
+        df_output['flag_pon_variance']    = flag_pon_variance
+        df_output['mask_rejected']        = master_mask
+
+        # Log2 copy ratio — NaN over masked windows so segmenters ignore them
+        df_output['log2_ratio'] = np.log2(np.clip(depth_scaled, a_min=1e-3, a_max=None))
+        df_output.loc[master_mask == 1, 'log2_ratio'] = np.nan
+
+        output_path = os.path.join(OUTPUT_DIR, f"{sample_name}_off_target_copy_ratios.tsv")
+        df_output.to_csv(output_path, sep='\t', index=True)
 
         # Quality flags
         df_output['flag_high_cv']         = flag_high_cv
