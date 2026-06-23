@@ -9,12 +9,13 @@ import statsmodels.api as sm
 
 '''
 Script that creates matrix with read counts per genome window (step 1) from normal WGS bams
-To add:
-log file instead of print statements
 
-python3 count_matrix_WGS.py --windows_bed ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed 
- --reference ../data_repo/GRCh38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fa --wgs_bams_dir /pedigree2/cui/CCLE_WXS/1000genomes_highcov_WGS/ 
- --matrix ../CCLE_WXS/WES2WGS_CCLE/100genomes_10wgs_normals_matrix.tsv --temp_dir ./
+python3 count_matrix_WGS.py \
+  --windows_bed ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed \
+  --reference ../data_repo/GRCh38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fa \
+  --wgs_bams_dir /pedigree2/cui/CCLE_WXS/1000genomes_highcov_WGS/ \
+  --matrix ../CCLE_WXS/WES2WGS_CCLE/1000genomes_10wgs_normals_matrix.tsv \
+  --temp_dir ./
 '''
 
 def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, reference_fasta=None):
@@ -53,15 +54,14 @@ def compute_gc_content(windows_bed_path, reference_fasta_path):
     
     # Run bedtools nuc
     nuc_bed = windows_bed.nucleotide_content(fi=reference_fasta_path)
-    print(nuc_bed.head())
     
-    # bedtools nuc appends calculation tracking columns to the end of the original BED file
-    # For a 4-column input BED (chrom, start, end, name), column 5 is %AT and column 6 is %GC
-    df_nuc = nuc_bed.to_dataframe(header=None)
+    # Read using pandas directly from the file path, specifying that row 0 
+    # is the header to avoid mixing string headers with data rows.
+    df_nuc = pd.read_csv(nuc_bed.fn, sep='\t', header=0)
     
-    # Extract the %GC column (index 5), dropping the header row if present
-    gc_series = df_nuc[5]
-    gc_series = gc_series[gc_series != '6_pct_gc'].astype(float).reset_index(drop=True)
+    # Extract the correct GC column using its text name assigned by bedtools
+    gc_series = df_nuc['6_pct_gc'].astype(float).reset_index(drop=True)
+    print(f"    -> Successfully parsed {len(gc_series)} window GC profiles.")
     return gc_series
 
 def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
@@ -69,9 +69,6 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
     Fits a LOESS curve of normalized_depth ~ GC% using autosomal windows,
     then predicts and normalizes across all genomic windows.
     """
-    # Use .values to strip pandas indices and force pure numpy boolean operations,
-    # preventing index misalignment when combining numpy array (autosome_indices)
-    # with pandas Series (depth_series, gc_series)
     valid_mask = (autosome_indices &
                   (depth_series.values > 0) &
                   (~np.isnan(gc_series.values)) &
@@ -85,8 +82,6 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
         return depth_series
 
     # Fit LOESS model: depth ~ GC content
-    # frac=0.1 means local regression spans a rolling 10% smoothing window neighborhood
-    # iters=3 applies robust biweight updates to downweight structural outlier artifacts
     loess_fit = sm.nonparametric.lowess(
         endog=train_depth, 
         exog=train_gc, 
@@ -96,7 +91,6 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
     )
     
     # Map the non-linear fitted trendline values to all windows across the entire genome
-    # We use numpy interpolation to infer fitted scaling adjustments for non-autosomal bins
     sort_idx = np.argsort(train_gc)
     fitted_values_all = np.interp(gc_series.values, train_gc[sort_idx], loess_fit[sort_idx])
     
@@ -110,7 +104,6 @@ def apply_loess_gc_correction(depth_series, gc_series, autosome_indices):
 def main():
 
     # 1. PARAMETERS & INPUT PATHS
-
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -130,39 +123,28 @@ def main():
     
     args = p.parse_args()
 
-    # Path to the actionable windows BED file generated in Step 1
     WINDOWS_BED = args.windows_bed
-
-    # Path to reference fasta
     REF_FASTA = args.reference
-    
-    # Directory containing your control/normal WGS BAM files
     WGS_BAM_DIR = args.wgs_bams_dir
+    
     BAM_PATTERN_BAM  = os.path.join(WGS_BAM_DIR, "*.bam")
     BAM_PATTERN_CRAM = os.path.join(WGS_BAM_DIR, "*.cram")
-    
-    # Processing settings
     THREADS_PER_BAM = args.t
-    
-    # Final matrix configuration output
     MATRIX_OUTPUT_TSV = args.matrix
-    
-    # Workspace directory for mosdepth intermediary outputs
     TMP_DIR = args.temp_dir
+    
     os.makedirs(TMP_DIR, exist_ok=True)
 
-
     # 2. FILE VERIFICATION & GC RUN
-
     bam_files = glob.glob(BAM_PATTERN_BAM) + glob.glob(BAM_PATTERN_CRAM)
     if not bam_files:
-        print(f"[-] Error: No BAM files found matching pattern: {BAM_PATTERN}")
+        print(f"[-] Error: No BAM/CRAM files found in target pattern directory: {WGS_BAM_DIR}")
         return
     if not os.path.exists(REF_FASTA):
         print(f"[-] Error: Reference FASTA missing at {REF_FASTA}. Required for GC calculations.")
         return
 
-    print(f"[+] Found {len(bam_files)} WGS BAM files to process.")
+    print(f"[+] Found {len(bam_files)} WGS alignment tracks to process.")
     
     # Compute base pair GC metrics for our window universe
     gc_content_series = compute_gc_content(WINDOWS_BED, REF_FASTA)
@@ -170,9 +152,7 @@ def main():
     depth_matrix_dict = {}
     window_coordinates_df = None
 
-
     # 3. MOSDEPTH LOGIC (STEP 2 COUNTS)
-
     for bam_path in bam_files:
         sample_name = os.path.basename(bam_path).split('.')[0]
         print(f"\n[+] Processing Sample: {sample_name}")
@@ -182,7 +162,6 @@ def main():
         sample_depths_df = parse_mosdepth_regions(output_prefix)
         
         if window_coordinates_df is None:
-            # Use the name column already built by define_genome_windows.py
             window_coordinates_df = sample_depths_df[['chrom', 'start', 'end', 'name']].copy()
             window_coordinates_df = window_coordinates_df.rename(columns={'name': 'window_id'})
 
@@ -191,14 +170,12 @@ def main():
     # Construct dataframe matrix
     matrix_W = pd.DataFrame(depth_matrix_dict, index=window_coordinates_df['window_id'])
 
-
-# 4. NORMALIZATION & LOESS GC CORRECTION (STEPS 2 & 3)
-
+    # 4. NORMALIZATION & LOESS GC CORRECTION (STEPS 2 & 3)
     autosome_indices = matrix_W.index.str.startswith(('chrX', 'chrY', 'chrM', 'X', 'Y', 'MT')) == False
     if not np.any(autosome_indices):
         autosome_indices = np.ones(len(matrix_W), dtype=bool)
 
-    # Dictionary to save raw scales for Option 2
+    # Dictionary to save raw scales for Option 2 reconstruction
     raw_medians_dict = {}
 
     for sample in matrix_W.columns:
@@ -223,7 +200,6 @@ def main():
         matrix_W[sample] = gc_corrected_depths / final_recenter_factor
 
     # 5. MATRIX EXPORT
-
     final_output_df = window_coordinates_df[['chrom', 'start', 'end']].copy()
     final_output_df['gc_pct'] = gc_content_series.values
     final_output_df.index = matrix_W.index 
