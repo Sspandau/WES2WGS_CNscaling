@@ -6,51 +6,56 @@ import numpy as np
 import pysam
 
 def load_scaling_factors(copy_ratio_tsv):
-    """
-    Loads copy-ratio windows and indexes them by chromosome.
-    Enforces a strict floor of 1.0 to completely disable downsampling.
-    """
-    if not os.path.exists(copy_ratio_tsv):
-        print(f"[-] Error: Copy ratio file '{copy_ratio_tsv}' does not exist.")
-        return {}
-
     df = pd.read_csv(copy_ratio_tsv, sep='\t')
     
-    # ----------------------------------------------------
-    # ADDITIVE-ONLY MATHEMATICAL FLUIDITY RULE
-    # ----------------------------------------------------
-    # Case A: If a window shows a deletion or neutral baseline (<= 1.0), lock it to 1.0.
-    # This guarantees that reads are never dropped or downsampled.
-    df['final_scale'] = np.where(df['depth_scaled_ratio'] <= 1.0, 1.0, df['depth_scaled_ratio'])
+    # Secure safe division boundaries
+    safe_ratio = np.where(df['depth_scaled_ratio'] <= 1e-4, 1e-4, df['depth_scaled_ratio'])
     
-    # Case B: Masked/rejected low-quality windows (Step 6 filters) also default to 1.0
-    df['final_scale'] = np.where(df['mask_rejected'] == 1, 1.0, df['final_scale'])
+    # Invert to turn (WES / Raw WGS) into the absolute Multiplier: (Raw WGS / WES)
+    upscale_factor = 1.0 / safe_ratio
     
-    # Structural protective ceiling to keep system memory/storage architecture stable
-    df['final_scale'] = np.clip(df['final_scale'], a_min=1.0, a_max=50.0)
+    # High-quality windows get upscaled; rejected ones stay at baseline 1.0
+    df['final_scale'] = np.where(df['mask_rejected'] == 1, 1.0, upscale_factor)
     
+    # Enforce safe structural constraints
+    df['final_scale'] = np.clip(df['final_scale'], a_min=1.0, a_max=200.0)
+    
+    # Inside load_scaling_factors(copy_ratio_tsv):
     windows_by_chrom = {}
     for chrom, group in df.groupby('chrom'):
+        # Force a standardized string layout (e.g., stripping 'chr' prefixes if they vary)
+        chrom_str = str(chrom).replace('chr', '') 
         sorted_group = group.sort_values('start')
-        windows_by_chrom[chrom] = list(zip(
+        windows_by_chrom[chrom_str] = list(zip(
             sorted_group['start'].astype(int), 
             sorted_group['end'].astype(int), 
             sorted_group['final_scale'].astype(float)
         ))
     return windows_by_chrom
 
-def get_scaling_factor(chrom, pos, windows_by_chrom):
+def get_scaling_factor(chrom, pos, windows_by_chrom, _cache=[None, None, None, 1.0]):
     """
-    Fast sequential lookup optimization. Because windows are sorted 
-    chronologically, loops break early once coordinates pass 'pos'.
+    Fast sequential lookup optimization utilizing a persistent mutable list 
+    as an instantaneous single-element lookbehind cache.
     """
-    if chrom not in windows_by_chrom:
+    chrom_clean = str(chrom).replace('chr', '')
+    
+    # 1. Micro-cache hit: If we are in the same chrom and within the same window bounds, return instantly
+    if _cache[0] == chrom_clean and _cache[1] <= pos < _cache[2]:
+        return _cache[3]
+        
+    if chrom_clean not in windows_by_chrom:
         return 1.0
-    for start, end, scale in windows_by_chrom[chrom]:
+        
+    # 2. Cache miss: Fall back to sequential loop search
+    for start, end, scale in windows_by_chrom[chrom_clean]:
         if start <= pos < end:
+            # Update cache element state
+            _cache[0], _cache[1], _cache[2], _cache[3] = chrom_clean, start, end, scale
             return scale
         if start > pos:
             break
+            
     return 1.0
 
 def write_scaled_pair(read1, read2, scale, outfile, stats):
@@ -71,10 +76,15 @@ def write_scaled_pair(read1, read2, scale, outfile, stats):
         
     base_qname = read1.query_name
     
+# Inside write_scaled_pair loop:
     for i in range(num_copies):
-        # Force duplicate flags off so downstream variant callers don't reject alignments
+        # Force flag states off explicitly across objects
         read1.is_duplicate = False
         read2.is_duplicate = False
+        
+        # Explicit bitwise clearing of duplicate flag bit (0x0400) from the raw field
+        read1.flag &= ~1024
+        read2.flag &= ~1024
         
         if i == 0:
             read1.query_name = base_qname
@@ -220,4 +230,4 @@ def main():
     print("\n" + "="*80 + "\n[+] ADDITIVE ALIGNMENT PROCESSING RUN SUCCESSFULLY COMPLETED!\n" + "="*80)
 
 if __name__ == "__main__":
-    main()
+    main()                                   

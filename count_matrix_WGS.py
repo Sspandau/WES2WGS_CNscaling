@@ -11,6 +11,10 @@ import statsmodels.api as sm
 Script that creates matrix with read counts per genome window (step 1) from normal WGS bams
 To add:
 log file instead of print statements
+
+python3 count_matrix_WGS.py --windows_bed ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed 
+ --reference ../data_repo/GRCh38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fa --wgs_bams_dir /pedigree2/cui/CCLE_WXS/1000genomes_highcov_WGS/ 
+ --matrix ../CCLE_WXS/WES2WGS_CCLE/100genomes_10wgs_normals_matrix.tsv --temp_dir ./
 '''
 
 def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, reference_fasta=None):
@@ -188,12 +192,14 @@ def main():
     matrix_W = pd.DataFrame(depth_matrix_dict, index=window_coordinates_df['window_id'])
 
 
-    # 4. NORMALIZATION & LOESS GC CORRECTION (STEPS 2 & 3)
+# 4. NORMALIZATION & LOESS GC CORRECTION (STEPS 2 & 3)
 
-    # Separate sex chromosomes from autosomes to prevent karyotypic biases
     autosome_indices = matrix_W.index.str.startswith(('chrX', 'chrY', 'chrM', 'X', 'Y', 'MT')) == False
     if not np.any(autosome_indices):
         autosome_indices = np.ones(len(matrix_W), dtype=bool)
+
+    # Dictionary to save raw scales for Option 2
+    raw_medians_dict = {}
 
     for sample in matrix_W.columns:
         raw_depths = matrix_W[sample].copy()
@@ -204,6 +210,7 @@ def main():
             print(f"    [!] Warning: Sample {sample} has an autosomal median depth of 0. Skipping.")
             continue
             
+        raw_medians_dict[sample] = median_autosomal_depth
         normalized_depths = raw_depths / median_autosomal_depth
         print(f"    -> Normalized {sample} against autosomal median: {median_autosomal_depth:.2f}")
         
@@ -215,22 +222,24 @@ def main():
         final_recenter_factor = np.median(gc_corrected_depths[autosome_indices])
         matrix_W[sample] = gc_corrected_depths / final_recenter_factor
 
-
     # 5. MATRIX EXPORT
 
     final_output_df = window_coordinates_df[['chrom', 'start', 'end']].copy()
     final_output_df['gc_pct'] = gc_content_series.values
-    final_output_df.index = matrix_W.index  # align to window_id strings before joining
+    final_output_df.index = matrix_W.index 
 
     final_output_df = pd.concat([final_output_df, matrix_W], axis=1)
-
     final_output_df.to_csv(MATRIX_OUTPUT_TSV, sep='\t', index=True)
+
+    # Save out the raw scaling scale factors for the SVD script
+    scales_output_path = MATRIX_OUTPUT_TSV + ".scales"
+    pd.Series(raw_medians_dict).to_csv(scales_output_path, sep='\t', header=False)
 
     print("\n" + "="*60)
     print(f"[+] STEP 2 & 3 SUCCESSFUL!")
-    print(f"    -> GC-Corrected Matrix shape: {matrix_W.shape} (Windows x Samples)")
     print(f"    -> Fully normalized baseline matrix exported to: {MATRIX_OUTPUT_TSV}")
+    print(f"    -> Saved raw scales for absolute tracking to: {scales_output_path}")
     print("="*60)
-
+    
 if __name__ == "__main__":
     main()

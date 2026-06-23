@@ -8,6 +8,8 @@ from sklearn.decomposition import TruncatedSVD
 Script that computes PoN using SVD and WGS matrix from prior step
 To Add:
 Log file instead of print statements
+
+python3 WGS2PoN.py --wgs_matrix ../CCLE_WXS/WES2WGS_CCLE/1000genomes_10wgs_normals_matrix.tsv --output ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals.tsv
 '''
 
 def main():
@@ -24,10 +26,14 @@ def main():
                    default=5, help="K determines top components to strip in SVD")
     p.add_argument("--output", metavar="FILE", required=True,
                    help="PoN from WGS samples using SVD (GATK style)")
+    # Add an argument to look for the scales file
+    p.add_argument("--wgs_matrix", metavar="FILE", required=True,
+                   help="GC corrected WGS counts per genomic window matrix")
+    # ... (keep other arguments the same) ...
     args = p.parse_args()
 
-    # The GC-corrected matrix file generated from Step 3
     INPUT_MATRIX_TSV = args.wgs_matrix
+    SCALES_FILE = INPUT_MATRIX_TSV + ".scales" # Auto-detect companion file
     
     # SVD Tuning Parameter
     # K determines how many top components (systematic technical noise/batch effects) to strip.
@@ -96,16 +102,29 @@ def main():
     W_denoised = W_denoised_centered + window_means
     
     # ----------------------------------------------------
-    # 4. STEP 4.3: COMPUTE FINAL PoN MEDIAN & VARIANCE
+    # NEW STEP: PROJECT DENOISED MATRIX TO TRUE RAW DEPTH
     # ----------------------------------------------------
-    print("[+] Generating Panel of Normals (PoN) baseline tracking statistics...")
+    if os.path.exists(SCALES_FILE):
+        print(f"[+] Found raw depth scales profile: {SCALES_FILE}")
+        scales_df = pd.read_csv(SCALES_FILE, sep='\t', header=None, index_col=0)
+        # Ensure sample column ordering matches matrix exactly
+        raw_medians = [scales_df.loc[col].values[0] for col in sample_cols]
+        raw_medians = np.array(raw_medians)
+        
+        # Multiply each sample column back by its original absolute baseline
+        W_denoised_raw = W_denoised * raw_medians
+    else:
+        print(f"[!] Warning: Scales file missing at {SCALES_FILE}. Defaulting to absolute 30x fallback.")
+        W_denoised_raw = W_denoised * 30.0
+
+    # ----------------------------------------------------
+    # 4.3: COMPUTE FINAL PoN MEDIAN & VARIANCE (ON RAW SCALE)
+    # ----------------------------------------------------
+    print("[+] Generating Panel of Normals (PoN) absolute tracking statistics...")
     
-    # Compute the robust per-window median baseline across the denoised samples
-    pon_median = np.median(W_denoised, axis=1)
-    
-    # Compute the per-window variance across the denoised samples
-    # High variance indicates a highly unreliable window (e.g. germline CNV hotspots)
-    pon_variance = np.var(W_denoised, axis=1)
+    # These metrics are now in absolute read counts (e.g. ~30x, varying by window)!
+    pon_median = np.median(W_denoised_raw, axis=1)
+    pon_variance = np.var(W_denoised_raw, axis=1)
 
     # ----------------------------------------------------
     # 5. ASSEMBLE AND SAVE THE TARGET PoN TRACK

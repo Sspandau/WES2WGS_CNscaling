@@ -16,6 +16,10 @@ Normalization strategy:
 - GC bias is estimated and corrected from the raw WES/PoN ratios themselves,
   avoiding any use of on-target WES depth which may be inflated by focal CN gains.
 - Output log2 copy ratios are directly comparable to WGS copy ratios.
+
+python3 scale_WES_tracks.py --offtarget_windows ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed 
+--pon_tsv ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals.tsv --wes_dir /pedigree2/cui/CCLE_WXS/SW579_THYROID/ 
+--output_dir ../CCLE_WXS/WES2WGS_CCLE/ --temp_dir ./
 '''
 
 def run_mosdepth(bam_path, bed_path, output_prefix, threads=4):
@@ -47,28 +51,15 @@ def parse_mosdepth_regions(output_prefix):
 
 def apply_pon_loess_gc_correction(raw_wes_depth, pon_median, offtarget_gc):
     """
-    Computes WES/PoN depth ratios and fits a LOESS GC bias curve directly
-    on those ratios. Corrects and returns the GC-corrected copy ratios.
-
-    By anchoring entirely to the PoN median, this avoids any CN inflation
-    from using on-target WES depth as a normalizer.
-
-    Args:
-        raw_wes_depth: numpy array of raw off-target WES depths per window
-        pon_median:    numpy array of PoN median WGS depths per window
-        offtarget_gc:  numpy array of GC fraction per window
-
-    Returns:
-        depth_scaled: numpy array of GC-corrected WES/PoN copy ratios
+    Computes true absolute scale factors by comparing raw WES depth 
+    directly to the absolute raw depth profile of the WGS PoN.
     """
-    # Protect against zero PoN median (unmappable or blacklisted windows)
+    # Protect against unmappable zero-depth PoN windows
     safe_pon_median = np.where(pon_median <= 0, 1e-4, pon_median)
 
-    # Step 1: Compute raw ratio of WES depth to WGS PoN baseline
+    # This ratio perfectly captures (Tumor WES Depth / Absolute WGS Window Depth)
     raw_ratio = raw_wes_depth / safe_pon_median
 
-    # Step 2: Fit LOESS GC bias curve on the raw ratios
-    # Only use windows with nonzero WES depth and valid GC values for training
     valid_mask = (
         (raw_wes_depth > 0) &
         (~np.isnan(offtarget_gc)) &
@@ -77,28 +68,22 @@ def apply_pon_loess_gc_correction(raw_wes_depth, pon_median, offtarget_gc):
     )
 
     if valid_mask.sum() < 50:
-        print("    [!] Warning: Too few valid windows to fit LOESS GC model. Returning uncorrected ratios.")
         return raw_ratio
 
     train_gc = offtarget_gc[valid_mask]
     train_ratio = raw_ratio[valid_mask]
 
+    # Fit LOESS curve directly to correct tumor-specific WES protocol bias
     loess_fit = sm.nonparametric.lowess(
-        endog=train_ratio,
-        exog=train_gc,
-        frac=0.1,
-        it=3,
-        return_sorted=False
+        endog=train_ratio, exog=train_gc, frac=0.1, it=3, return_sorted=False
     )
 
-    # Step 3: Interpolate fitted curve to all windows (including zero-depth ones)
     sort_idx = np.argsort(train_gc)
     fitted_all = np.interp(offtarget_gc, train_gc[sort_idx], loess_fit[sort_idx])
     fitted_all = np.clip(fitted_all, a_min=1e-4, a_max=None)
 
-    # Step 4: Divide raw ratios by the fitted GC curve to remove bias
+    # This depth_scaled variable tracks exactly how deep the WES is relative to the absolute WGS profile
     depth_scaled = raw_ratio / fitted_all
-
     return depth_scaled
 
 
