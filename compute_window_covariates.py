@@ -68,11 +68,14 @@ def compute_dist_to_target(windows_bed_path, targets_bed_path):
     windows = pybedtools.BedTool(windows_bed_path).sort()
     targets = pybedtools.BedTool(targets_bed_path).sort()
     closest = windows.closest(targets, d=True)
-    df = closest.to_dataframe(
-        names=['chrom', 'start', 'end', 'name',
-               't_chrom', 't_start', 't_end', 'distance'],
-        usecols=[0, 1, 2, 3, 7]
-    )
+
+    # bedtools closest -d appends ALL target-file columns before the final
+    # distance column, so total width = (window cols) + (target cols) + 1.
+    # Rather than hardcode target column count, read headerless and grab
+    # window cols [0:4] + the last column (always distance) by position.
+    raw_df = pd.read_csv(closest.fn, sep='\t', header=None)
+    df = raw_df.iloc[:, [0, 1, 2, 3, -1]].copy()
+    df.columns = ['chrom', 'start', 'end', 'name', 'distance']
     df['distance'] = pd.to_numeric(df['distance'], errors='coerce')
     # -1 from bedtools closest means no feature on that chromosome at all
     df.loc[df['distance'] < 0, 'distance'] = df['distance'].max()
