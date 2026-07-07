@@ -143,9 +143,14 @@ def main():
         print(f"    [+] Found covariates template. Injecting mappability and dist_to_target...")
         cov_df = pd.read_csv(COVARIATES_FILE, sep='\t', index_col=0)
         
-        # Pull only the required missing features safely matching the index (window_id)
-        pon_df['mappability'] = cov_df.reindex(pon_df.index)['mappability']
-        pon_df['dist_to_target'] = cov_df.reindex(pon_df.index)['dist_to_target']
+        # Create a clean dictionary mapping from the covariates file
+        # This completely ignores duplicate index errors
+        map_dict = cov_df['mappability'].to_dict()
+        dist_dict = cov_df['dist_to_target'].to_dict()
+        
+        # Map values directly onto pon_df using the index labels
+        pon_df['mappability'] = pon_df.index.map(map_dict)
+        pon_df['dist_to_target'] = pon_df.index.map(dist_dict)
     else:
         print(f"    [!] Warning: Covariates file missing at {COVARIATES_FILE}. Filling with NaNs.")
         pon_df['mappability'] = np.nan
