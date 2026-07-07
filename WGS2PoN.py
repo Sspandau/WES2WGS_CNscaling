@@ -9,7 +9,7 @@ Script that computes PoN using SVD and WGS matrix from prior step
 To Add:
 Log file instead of print statements
 
-python3 WGS2PoN.py --wgs_matrix ../CCLE_WXS/WES2WGS_CCLE/1000genomes_10wgs_normals_matrix.tsv --output ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals.tsv
+python3 WGS2PoN.py --wgs_matrix ../CCLE_WXS/WES2WGS_CCLE/1000genomes_10wgs_normals_noautosom_matrix.tsv --output ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals_noautosome.tsv
 '''
 
 def main():
@@ -26,9 +26,9 @@ def main():
                    default=5, help="K determines top components to strip in SVD")
     p.add_argument("--output", metavar="FILE", required=True,
                    help="PoN from WGS samples using SVD (GATK style)")
-    # Add an argument to look for the scales file
-    p.add_argument("--wgs_matrix", metavar="FILE", required=True,
-                   help="GC corrected WGS counts per genomic window matrix")
+    # Add an argument to look for the covariates file
+    p.add_argument("--covariates", metavar="FILE", required=False,
+                   help="Covariates TSV from compute_window_covariates.py (same windows as PoN)")
     # ... (keep other arguments the same) ...
     args = p.parse_args()
 
@@ -126,7 +126,7 @@ def main():
     pon_median = np.median(W_denoised_raw, axis=1)
     pon_variance = np.var(W_denoised_raw, axis=1)
 
-    # ----------------------------------------------------
+   # ----------------------------------------------------
     # 5. ASSEMBLE AND SAVE THE TARGET PoN TRACK
     # ----------------------------------------------------
     print("[+] Merging statistics into final track table layout...")
@@ -135,6 +135,23 @@ def main():
     pon_df['pon_median'] = pon_median
     pon_df['pon_variance'] = pon_variance
     
+    # --- NEW: Inject Mappability and Proximity to Target ---
+    # Change this path to match your actual covariates file location
+    COVARIATES_FILE = args.covariates
+
+    if os.path.exists(COVARIATES_FILE):
+        print(f"    [+] Found covariates template. Injecting mappability and dist_to_target...")
+        cov_df = pd.read_csv(COVARIATES_FILE, sep='\t', index_col=0)
+        
+        # Pull only the required missing features safely matching the index (window_id)
+        pon_df['mappability'] = cov_df.reindex(pon_df.index)['mappability']
+        pon_df['dist_to_target'] = cov_df.reindex(pon_df.index)['dist_to_target']
+    else:
+        print(f"    [!] Warning: Covariates file missing at {COVARIATES_FILE}. Filling with NaNs.")
+        pon_df['mappability'] = np.nan
+        pon_df['dist_to_target'] = np.nan
+    # --------------------------------------------------------
+
     # Set up a strict filtering flag recommendation column 
     # Flag windows in the top 1% highest variance bracket as potentially volatile
     variance_threshold = np.percentile(pon_variance, 99)
@@ -142,7 +159,7 @@ def main():
     
     print(f"    -> Flagged {pon_df['is_high_variance'].sum()} windows exceeding 99th percentile variance threshold ({variance_threshold:.4e})")
 
-    # Export
+    # Export (the resulting TSV will now natively include the new features!)
     pon_df.to_csv(PON_OUTPUT_TSV, sep='\t', index=True)
     
     print("\n" + "="*60)

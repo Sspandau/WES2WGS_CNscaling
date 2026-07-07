@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import pybedtools
 import statsmodels.api as sm
+from pygam import LinearGAM, s
 
 '''
 Script that scales WES off-target depth to WGS-comparable copy ratios using
@@ -17,8 +18,8 @@ Normalization strategy:
   avoiding any use of on-target WES depth which may be inflated by focal CN gains.
 - Output log2 copy ratios are directly comparable to WGS copy ratios.
 
-python3 scale_WES_tracks.py --offtarget_windows ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed 
---pon_tsv ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals.tsv --wes_dir /pedigree2/cui/CCLE_WXS/SW579_THYROID/ 
+python3 scale_WES_tracks.py --offtarget_windows ../CCLE_WXS/WES2WGS_CCLE/v5_offtargets.bed /
+--pon_tsv ../CCLE_WXS/1000genomes_highcov_WGS/PoN_1000genomes_wgs_normals_noautosome.tsv --wes_dir /pedigree2/cui/CCLE_WXS/SW579_THYROID/ /
 --output_dir ../CCLE_WXS/WES2WGS_CCLE/ --temp_dir ./
 '''
 
@@ -87,6 +88,58 @@ def apply_pon_loess_gc_correction(raw_wes_depth, pon_median, offtarget_gc):
     return depth_scaled
 
 
+def apply_pon_multivariate_gam_correction(raw_wes_depth, pon_median, offtarget_gc, mappability, dist_to_target):
+    """
+    Replaces 1D LOESS with a Single-Sample Multi-Variable GAM using WGS PoN as baseline.
+    """
+    safe_pon_median = np.where(pon_median <= 0, 1e-4, pon_median)
+    raw_ratio = raw_wes_depth / safe_pon_median
+
+    # 1. Build DataFrame for easy filtering
+    df_fit = pd.DataFrame({
+        'y': raw_ratio,
+        'gc': offtarget_gc,
+        'map': mappability,
+        'dist': dist_to_target
+    })
+
+    # 2. Strict mask to protect against mapping artifacts and extreme copy number
+    # WES off-target can be noisy; drop top/bottom 1% to ignore focal alterations
+    lo, hi = df_fit['y'].quantile([0.01, 0.99])
+    
+    valid_mask = (
+        (raw_wes_depth > 0) & 
+        (df_fit['y'] >= lo) & (df_fit['y'] <= hi) &
+        (~df_fit['gc'].isna()) & (~df_fit['map'].isna()) & (~df_fit['dist'].isna())
+    )
+
+    if valid_mask.sum() < 500:
+        return raw_ratio  # Fallback if sample data is too sparse
+
+    df_train = df_fit[valid_mask]
+
+    # 3. Fit GAM on the single sample's WES/WGS-PoN ratio
+    X_train = df_train[['gc', 'map', 'dist']].values
+    y_train = df_train['y'].values
+
+    # Fit smooth terms across all 3 spatial and biochemical covariates
+    gam = LinearGAM(
+        s(0, n_splines=15, lam=1.0) +  # gc_pct
+        s(1, n_splines=10, lam=1.0) +  # mappability
+        s(2, n_splines=10, lam=1.0)    # dist_to_target
+    )
+    gam.fit(X_train, y_train)
+
+    # 4. Predict the expected bias multiplier across ALL windows
+    X_all = df_fit[['gc', 'map', 'dist']].values
+    predicted_bias = gam.predict(X_all)
+    predicted_bias = np.clip(predicted_bias, a_min=1e-4, a_max=None)
+
+    # Correct the ratio
+    depth_scaled = raw_ratio / predicted_bias
+    return depth_scaled
+
+
 def main():
 
     # 1. PARAMETERS & INPUT PATHS
@@ -135,9 +188,11 @@ def main():
     df_pon = pd.read_csv(PON_TSV, sep='\t', index_col=0)
 
     # Extract PoN arrays used throughout
-    pon_median    = df_pon['pon_median'].values
-    pon_variance  = df_pon['pon_variance'].values
-    offtarget_gc  = df_pon['gc_pct'].values
+    pon_median     = df_pon['pon_median'].values
+    pon_variance   = df_pon['pon_variance'].values
+    offtarget_gc   = df_pon['gc_pct'].values
+    mappability    = df_pon['mappability'].values      # <-- Now available!
+    dist_to_target = df_pon['dist_to_target'].values   # <-- Now available!
 
     print(f"[+] PoN loaded: {len(df_pon)} windows.")
     print(f"[+] Found {len(tumor_bams)} tumor WES BAMs to process.")
@@ -169,7 +224,7 @@ def main():
         # GC bias is estimated directly from WES/PoN ratios — no on-target
         # WES depth is used, avoiding CN inflation from focal amplifications.
         print(f"    -> Computing PoN-anchored ratios and fitting LOESS GC correction...")
-        depth_scaled = apply_pon_loess_gc_correction(raw_wes_depth, pon_median, offtarget_gc)
+        depth_scaled = apply_pon_multivariate_gam_correction(raw_wes_depth, pon_median, offtarget_gc, mappability, dist_to_target)
 
 
         # 4. QUALITY FILTERING & FLAGGING (Step 6)
