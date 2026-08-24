@@ -77,6 +77,29 @@ def load_data(path):
     return df
 
 
+def load_mask_regions(path):
+    """Load a CSV/TSV of regions to mask. Expected columns: chrom,start,end.
+    If exact column names are not found, the first three columns are used.
+    Returns a DataFrame with columns `chrom` (str), `start` (int), `end` (int).
+    """
+    m = load_data(path)
+    cols = {c.lower(): c for c in m.columns}
+    if "chrom" in cols and "start" in cols and "end" in cols:
+        m = m.rename(columns={cols["chrom"]: "chrom", cols["start"]: "start", cols["end"]: "end"})
+    else:
+        # fallback: take first three columns
+        if m.shape[1] < 3:
+            raise ValueError("Mask regions file must have at least three columns: chrom,start,end")
+        first_three = m.columns[:3]
+        m = m.rename(columns={first_three[0]: "chrom", first_three[1]: "start", first_three[2]: "end"})
+
+    m = m[["chrom", "start", "end"]].copy()
+    m["chrom"] = m["chrom"].astype(str)
+    m["start"] = m["start"].astype(int)
+    m["end"] = m["end"].astype(int)
+    return m
+
+
 def split_bin_column(df, bin_col):
     """Parse a combined bin identifier like 'chr1:100000-200000' or
     'chr1_100000_200000' into chrom / start / end columns."""
@@ -519,6 +542,9 @@ def main():
     p.add_argument("--n-permutations", type=int, default=999,
                    help="Number of permutations for Moran's I p-value (default: 999)")
     p.add_argument("--seed", type=int, default=0, help="Random seed for permutation test")
+    p.add_argument("--mask-regions", default=None,
+                   help="Optional CSV/TSV of regions to mask as non-amplified (columns: chrom,start,end)."
+                        "Masked bins are treated as non-high for clustering but do not create hard breaks.")
     p.add_argument("--outdir", default="peak_cluster_output", help="Output directory")
     args = p.parse_args()
 
@@ -563,6 +589,26 @@ def main():
 
     df = smooth_per_chrom(df, "value_raw", smooth_window)
     df, threshold = call_high_bins(df, args.quantile)
+    # Apply mask regions (if provided): these bins are treated as non-amplified
+    # (is_high = False) and cannot themselves establish clusters, but they are
+    # not treated as hard physical breaks.
+    if args.mask_regions is not None:
+        mask_df = load_mask_regions(args.mask_regions)
+        df["masked"] = False
+        masked_count = 0
+        for _, mrow in mask_df.iterrows():
+            mch = str(mrow["chrom"])
+            mstart = int(mrow["start"])
+            mend = int(mrow["end"])
+            sel = (df["chrom"] == mch) & (df["start"] >= mstart) & (df["start"] < mend)
+            if sel.any():
+                df.loc[sel, "masked"] = True
+                masked_count += sel.sum()
+        # Ensure masked bins are not considered 'high'
+        df.loc[df["masked"], "is_high"] = False
+        print(f"Applied mask regions from {args.mask_regions}: marked {int(masked_count)} bins as masked (non-amplified)")
+    else:
+        df["masked"] = False
     print(f"'High' threshold (quantile {args.quantile}) on smoothed values: {threshold:.4f}")
     print(f"Bins above threshold: {df['is_high'].sum()} / {len(df)}")
 
@@ -617,6 +663,8 @@ def main():
             f.write(f"Max gap allowed:       {args.max_gap} bin(s)\n")
         f.write(f"Min cluster size:      {args.min_cluster_size} bins\n")
         f.write(f"Clusters found:        {len(clusters)}\n")
+        if df["masked"].any():
+            f.write(f"Masked bins:           {int(df['masked'].sum())} (from {args.mask_regions})\n")
         if len(clusters):
             f.write(f"Largest cluster:       {clusters.loc[clusters['n_bins'].idxmax(), 'chrom']}: "
                      f"{int(clusters.loc[clusters['n_bins'].idxmax(),'start'])}-"
