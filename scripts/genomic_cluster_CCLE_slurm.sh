@@ -7,6 +7,7 @@
 #SBATCH --mem=8G               # Adjust memory as needed
 
 INPUT_TSV="$1"
+RECURRENT_MASK_REGIONS="$2"
 
 # Dynamically construct the output directory based on the input file
 # e.g., turns /.../NCIH889_LUNG/SRR8618966_off_target_copy_ratios.tsv 
@@ -31,6 +32,7 @@ python3 /home/sspandau/WES2WGS_CNscaling/scripts/genomic_cluster_upscaleddepth.p
     --input "$INPUT_TSV" \
     --column predicted_loess_upscale_depth \
     --rebin-to 25000 \
+    --mask-regions "$RECURRENT_MASK_REGIONS" \
     --max-gap auto \
     --outdir "$OUTDIR"
 

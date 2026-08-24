@@ -2,6 +2,7 @@
 
 # Base directory containing the outputs from the previous step
 RESULTS_DIR="/home/sspandau/CCLE_WXS/WES2WGS_CCLE"
+MASK_REGIONS="/home/sspandau/CCLE_WXS/WES2WGS_CCLE/recurrent_amplification_v3_optimization/best_combo_recurrent_orange_overlap.csv"
 
 # Ensure the logs directory exists for Slurm output
 mkdir -p logs
@@ -22,6 +23,6 @@ for TSV_FILE in "$RESULTS_DIR"/*/*_off_target_copy_ratios.tsv; do
     echo "Submitting clustering job for $SAMPLE_DIR -> $FILE_NAME"
     
     # Submit the Slurm job, passing the full path to the TSV file
-    sbatch genomic_cluster_CCLE_slurm.sh "$TSV_FILE"
+    sbatch genomic_cluster_CCLE_slurm.sh "$TSV_FILE" "$MASK_REGIONS"
 
 done
