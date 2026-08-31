@@ -190,10 +190,93 @@ def smooth_per_chrom(df, value_col, window):
     return df
 
 
-def call_high_bins(df, quantile):
+def call_high_bins(df, quantile, cn_floor=None):
     threshold = df["smoothed"].quantile(quantile)
+    if cn_floor is not None:
+        threshold = max(float(threshold), float(cn_floor))
     df["is_high"] = df["smoothed"] > threshold
     return df, threshold
+
+
+def compute_binarized_overlap_metrics(wes_df, wgs_df, wes_value_col="value_raw", wgs_value_col="value_raw",
+                                     wes_quantile=0.90, wgs_quantile=0.90,
+                                     wes_smooth_window=None, wgs_smooth_window=None,
+                                     rebin_to=None, cn_floor=None):
+    """Compare two rescaled bin tracks using a binary threshold-on-high approach.
+
+    Each track is smoothed within chromosome, thresholded at its own quantile,
+    and then reduced to a set of genomic bins with values above threshold. We
+    compare the resulting high-bin sets using Jaccard similarity and the
+    overlap coefficient.
+
+    Returns a dict with:
+      - wes_threshold, wgs_threshold
+      - wes_high_bins, wgs_high_bins
+      - jaccard, overlap_coefficient
+      - intersection_bins, union_bins
+    """
+    wes_proc = wes_df.copy()
+    wgs_proc = wgs_df.copy()
+
+    if rebin_to is not None:
+        wes_proc = rebin_to_resolution(wes_proc[["chrom", "start", wes_value_col]].copy(), wes_value_col, rebin_to)
+        wgs_proc = rebin_to_resolution(wgs_proc[["chrom", "start", wgs_value_col]].copy(), wgs_value_col, rebin_to)
+
+    wes_proc = smooth_per_chrom(wes_proc, wes_value_col, wes_smooth_window if wes_smooth_window is not None else 5)
+    wgs_proc = smooth_per_chrom(wgs_proc, wgs_value_col, wgs_smooth_window if wgs_smooth_window is not None else 5)
+
+    wes_q = float(wes_proc["smoothed"].quantile(wes_quantile))
+    wgs_q = float(wgs_proc["smoothed"].quantile(wgs_quantile))
+
+    if cn_floor is not None and wes_q < cn_floor and wgs_q < cn_floor:
+        wes_threshold = float(cn_floor)
+        wgs_threshold = float(cn_floor)
+        wes_proc["is_high"] = wes_proc["smoothed"] > wes_threshold
+        wgs_proc["is_high"] = wgs_proc["smoothed"] > wgs_threshold
+    else:
+        wes_proc, wes_threshold = call_high_bins(wes_proc, wes_quantile)
+        wgs_proc, wgs_threshold = call_high_bins(wgs_proc, wgs_quantile)
+
+    wes_high = set(
+        (str(row["chrom"]), int(row["start"]))
+        for _, row in wes_proc[(wes_proc["is_high"])][["chrom", "start"]].iterrows()
+    )
+    wgs_high = set(
+        (str(row["chrom"]), int(row["start"]))
+        for _, row in wgs_proc[(wgs_proc["is_high"])][["chrom", "start"]].iterrows()
+    )
+
+    intersection = wes_high & wgs_high
+    union = wes_high | wgs_high
+    n_inter = len(intersection)
+    n_union = len(union)
+    n_wes = len(wes_high)
+    n_wgs = len(wgs_high)
+
+    if n_union == 0:
+        jaccard = 1.0 if n_inter == 0 else 0.0
+    else:
+        jaccard = n_inter / n_union
+
+    if n_wes == 0 and n_wgs == 0:
+        overlap = 1.0
+    elif min(n_wes, n_wgs) == 0:
+        overlap = 0.0
+    else:
+        overlap = n_inter / min(n_wes, n_wgs)
+
+    return {
+        "wes_threshold": float(wes_threshold),
+        "wgs_threshold": float(wgs_threshold),
+        "n_wes_high_bins": n_wes,
+        "n_wgs_high_bins": n_wgs,
+        "n_intersection_bins": n_inter,
+        "n_union_bins": n_union,
+        "jaccard": float(jaccard),
+        "overlap_coefficient": float(overlap),
+        "wes_high_bins": wes_high,
+        "wgs_high_bins": wgs_high,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -546,6 +629,21 @@ def main():
                    help="Optional CSV/TSV of regions to mask as non-amplified (columns: chrom,start,end)."
                         "Masked bins are treated as non-high for clustering but do not create hard breaks.")
     p.add_argument("--outdir", default="peak_cluster_output", help="Output directory")
+    p.add_argument("--compare-wgs-input", default=None,
+                   help="Optional second input file for a WGS-vs-WES binary-overlap comparison. "
+                        "If supplied, this is compared against the primary --input and --column, "
+                        "using same genomic bins after rescaling/smoothing.")
+    p.add_argument("--compare-wgs-column", default=None,
+                   help="Value column in --compare-wgs-input to compare against the primary input. "
+                        "Defaults to the same value name as --column.")
+    p.add_argument("--compare-wes-quantile", type=float, default=0.90,
+                   help="Threshold quantile for the rescaled WES values in the binary overlap comparison")
+    p.add_argument("--compare-wgs-quantile", type=float, default=0.90,
+                   help="Threshold quantile for the WGS values in the binary overlap comparison")
+    p.add_argument("--compare-rebin-to", type=int, default=None,
+                   help="Optional resolution in bp to harmonize both tracks before computing the metric")
+    p.add_argument("--cn-floor", type=float, default=3.0,
+                   help="Absolute copy-number floor for 'high' bins: if both WES and WGS 0.9 quantiles are below this value, use this threshold instead (default: 3.0)")
     args = p.parse_args()
 
     outdir = Path(args.outdir)
@@ -588,13 +686,12 @@ def main():
               f"({'no extra smoothing after rebinning' if args.rebin_to is not None else 'default'})")
 
     df = smooth_per_chrom(df, "value_raw", smooth_window)
-    df, threshold = call_high_bins(df, args.quantile)
-    # Apply mask regions (if provided): these bins are treated as non-amplified
-    # (is_high = False) and cannot themselves establish clusters, but they are
-    # not treated as hard physical breaks.
+    df["masked"] = False
+
+    # Apply mask regions before thresholding/fallback decisions so recurrent bins
+    # do not contribute to the CN-floor check or to the effective quantile.
     if args.mask_regions is not None:
         mask_df = load_mask_regions(args.mask_regions)
-        df["masked"] = False
         masked_count = 0
         for _, mrow in mask_df.iterrows():
             mch = str(mrow["chrom"])
@@ -604,11 +701,50 @@ def main():
             if sel.any():
                 df.loc[sel, "masked"] = True
                 masked_count += sel.sum()
-        # Ensure masked bins are not considered 'high'
-        df.loc[df["masked"], "is_high"] = False
         print(f"Applied mask regions from {args.mask_regions}: marked {int(masked_count)} bins as masked (non-amplified)")
+
+    compare_wgs_threshold = None
+    cn_floor_threshold = None
+
+    if args.compare_wgs_input is not None:
+        compare_path = Path(args.compare_wgs_input)
+        if compare_path.exists():
+            compare_df = load_data(compare_path)
+            compare_col = args.compare_wgs_column or args.column
+            if compare_col not in compare_df.columns:
+                raise ValueError(
+                    f"Comparison WGS column '{compare_col}' not found in {compare_path}. "
+                    f"Available columns: {list(compare_df.columns)}"
+                )
+            if args.bin_col:
+                wgs_df = split_bin_column(compare_df.copy(), args.bin_col)
+            else:
+                if args.chrom_col not in compare_df.columns or args.start_col not in compare_df.columns:
+                    raise ValueError(
+                        f"Comparison WGS input must have '{args.chrom_col}' and '{args.start_col}' columns "
+                        f"or a combined '{args.bin_col}' column when --compare-wgs-input is used."
+                    )
+                wgs_df = compare_df.rename(columns={args.chrom_col: "chrom", args.start_col: "start"})
+            wgs_df["chrom"] = wgs_df["chrom"].astype(str)
+            wgs_df["value_raw"] = wgs_df[compare_col].astype(float)
+            wgs_df = wgs_df.dropna(subset=["value_raw", "start"]).sort_values(["chrom", "start"]).reset_index(drop=True)
+            if args.compare_rebin_to is not None:
+                wgs_df = rebin_to_resolution(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", args.compare_rebin_to)
+            wgs_q = float(smooth_per_chrom(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", smooth_window)["smoothed"].quantile(args.compare_wgs_quantile))
+            wes_q = float(df.loc[~df["masked"], "smoothed"].quantile(args.compare_wes_quantile)) if df["masked"].any() else float(df["smoothed"].quantile(args.compare_wes_quantile))
+            if args.cn_floor is not None and wes_q < args.cn_floor and wgs_q < args.cn_floor:
+                cn_floor_threshold = float(args.cn_floor)
+                compare_wgs_threshold = float(args.cn_floor)
+                print(f"CN floor applied: both WES and WGS 0.9 quantiles are below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
+
+    if cn_floor_threshold is not None:
+        df, threshold = call_high_bins(df, args.quantile, cn_floor=cn_floor_threshold)
     else:
-        df["masked"] = False
+        df, threshold = call_high_bins(df, args.quantile)
+
+    # Ensure masked bins are not considered 'high' after thresholding.
+    if args.mask_regions is not None:
+        df.loc[df["masked"], "is_high"] = False
     print(f"'High' threshold (quantile {args.quantile}) on smoothed values: {threshold:.4f}")
     print(f"Bins above threshold: {df['is_high'].sum()} / {len(df)}")
 
@@ -679,6 +815,70 @@ def main():
                 "(e.g. permutation testing of cluster size/strength) and changepoint/"
                 "segmentation methods (e.g. PELT via the `ruptures` package, or circular "
                 "binary segmentation) as an alternative to the threshold-based approach here.\n")
+    if args.compare_wgs_input is not None:
+        compare_path = Path(args.compare_wgs_input)
+        if not compare_path.exists():
+            raise FileNotFoundError(f"Comparison WGS input not found: {compare_path}")
+        compare_df = load_data(compare_path)
+        compare_col = args.compare_wgs_column or args.column
+        if compare_col not in compare_df.columns:
+            raise ValueError(
+                f"Comparison WGS column '{compare_col}' not found in {compare_path}. "
+                f"Available columns: {list(compare_df.columns)}"
+            )
+
+        if args.bin_col:
+            wgs_df = split_bin_column(compare_df.copy(), args.bin_col)
+        else:
+            if args.chrom_col not in compare_df.columns or args.start_col not in compare_df.columns:
+                raise ValueError(
+                    f"Comparison WGS input must have '{args.chrom_col}' and '{args.start_col}' columns "
+                    f"or a combined '{args.bin_col}' column when --compare-wgs-input is used."
+                )
+            wgs_df = compare_df.rename(columns={args.chrom_col: "chrom", args.start_col: "start"})
+        wgs_df["chrom"] = wgs_df["chrom"].astype(str)
+        wgs_df["value_raw"] = wgs_df[compare_col].astype(float)
+        wgs_df = wgs_df.dropna(subset=["value_raw", "start"]).sort_values(["chrom", "start"]).reset_index(drop=True)
+
+        if args.compare_rebin_to is not None:
+            wgs_df = rebin_to_resolution(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", args.compare_rebin_to)
+            df = rebin_to_resolution(df[["chrom", "start", "value_raw"]].copy(), "value_raw", args.compare_rebin_to)
+
+        metrics = compute_binarized_overlap_metrics(
+            df, wgs_df,
+            wes_value_col="value_raw",
+            wgs_value_col="value_raw",
+            wes_quantile=args.compare_wes_quantile,
+            wgs_quantile=args.compare_wgs_quantile,
+            wes_smooth_window=smooth_window,
+            wgs_smooth_window=smooth_window,
+            rebin_to=args.compare_rebin_to,
+            cn_floor=args.cn_floor,
+        )
+        metrics_path = outdir / "wgs_wes_overlap_metrics.tsv"
+        metric_rows = [{
+            "wes_threshold": metrics["wes_threshold"],
+            "wgs_threshold": metrics["wgs_threshold"],
+            "n_wes_high_bins": metrics["n_wes_high_bins"],
+            "n_wgs_high_bins": metrics["n_wgs_high_bins"],
+            "n_intersection_bins": metrics["n_intersection_bins"],
+            "n_union_bins": metrics["n_union_bins"],
+            "jaccard": metrics["jaccard"],
+            "overlap_coefficient": metrics["overlap_coefficient"],
+        }]
+        pd.DataFrame(metric_rows).to_csv(metrics_path, sep='\t', index=False)
+        print(f"Binarized WES/WGS overlap metrics saved to {metrics_path}")
+        print(
+            "Jaccard = {:.4f}, overlap coefficient = {:.4f} "
+            "(WES high bins = {}, WGS high bins = {}, shared = {})".format(
+                metrics["jaccard"],
+                metrics["overlap_coefficient"],
+                metrics["n_wes_high_bins"],
+                metrics["n_wgs_high_bins"],
+                metrics["n_intersection_bins"],
+            )
+        )
+
     print(f"Summary saved to {summary_path}")
 
 
