@@ -9,11 +9,12 @@
 WES_INPUT="${1:-}"
 WGS_INPUT="${2:-}"
 MASK_REGIONS="${3:-}"
-WGS_COLUMN="${4:-wgs_tumor_depth}"
-OUTDIR="${5:-}"
+WES_COLUMN="${4:-predicted_loess_upscale_depth}"
+WGS_COLUMN="${5:-wgs_tumor_depth}"
+OUTDIR="${6:-}"
 
 if [ -z "$WES_INPUT" ] || [ -z "$WGS_INPUT" ]; then
-    echo "Usage: sbatch compare_wes_wgs_overlap_slurm.sh WES_INPUT WGS_INPUT [MASK_REGIONS] [WGS_COLUMN] [OUTDIR]" >&2
+    echo "Usage: sbatch compare_wes_wgs_overlap_slurm.sh WES_INPUT WGS_INPUT [MASK_REGIONS] [WES_COLUMN] [WGS_COLUMN] [OUTDIR]" >&2
     exit 1
 fi
 
@@ -26,7 +27,7 @@ conda activate cfamp
 
 ARGS=(
     --wes-input "$WES_INPUT"
-    --wes-column predicted_loess_upscale_depth
+    --wes-column "$WES_COLUMN"
     --wgs-input "$WGS_INPUT"
     --wgs-column "$WGS_COLUMN"
     --rebin-to 25000
