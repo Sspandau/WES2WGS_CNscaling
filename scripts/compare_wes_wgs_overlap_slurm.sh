@@ -9,7 +9,7 @@
 WES_INPUT="${1:-}"
 WGS_INPUT="${2:-}"
 MASK_REGIONS="${3:-}"
-WGS_COLUMN="${4:-predicted_loess_upscale_depth}"
+WGS_COLUMN="${4:-wgs_tumor_depth}"
 OUTDIR="${5:-}"
 
 if [ -z "$WES_INPUT" ] || [ -z "$WGS_INPUT" ]; then
