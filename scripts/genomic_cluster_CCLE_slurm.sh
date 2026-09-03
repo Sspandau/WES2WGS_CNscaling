@@ -2,7 +2,7 @@
 #SBATCH --job-name=genomic_cluster
 #SBATCH --output=/home/sspandau/logs/%x_%A_%a.out
 #SBATCH --error=/home/sspandau/logs/%x_%A_%a.err
-#SBATCH --time=04:00:00        # Adjust time as needed
+#SBATCH --time=24:00:00        # Adjust time as needed
 #SBATCH --cpus-per-task=2      # Adjust CPUs as needed
 #SBATCH --mem=8G               # Adjust memory as needed
 
