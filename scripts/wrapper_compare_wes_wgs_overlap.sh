@@ -11,7 +11,7 @@
 
 WES_ROOT="${1:-/home/sspandau/CCLE_WXS/WES2WGS_CCLE}"
 WGS_ROOT="${2:-/home/sspandau/CCLE_WGS}"
-MASK_REGIONS="${3:-}"
+MASK_REGIONS="${3:-/home/sspandau/CCLE_WXS/WES2WGS_CCLE/recurrent_amplification_v3_optimization/best_combo_recurrent_orange_overlap.csv}"
 WES_COLUMN="${4:-predicted_loess_upscale_depth}"
 WGS_COLUMN="${5:-wgs_tumor_depth}"
 
