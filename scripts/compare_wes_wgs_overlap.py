@@ -95,9 +95,20 @@ def apply_mask(df, mask_df):
     return df
 
 
+def normalize_to_cn_like(df, value_col, mask_col):
+    df = df.copy()
+    valid = df.loc[(~df[mask_col]) & df[value_col].notna(), value_col]
+    denom = float(valid.median()) if not valid.empty else np.nan
+    if not np.isfinite(denom) or denom <= 0:
+        df["cn_like"] = df[value_col]
+    else:
+        df["cn_like"] = df[value_col] / denom
+    return df
+
+
 def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
-    wes_values = df["wes_smoothed"]
-    wgs_values = df["wgs_smoothed"]
+    wes_values = df["wes_cn_like"]
+    wgs_values = df["wgs_cn_like"]
 
     wes_clean = wes_values[~df["wes_masked"]].dropna()
     wgs_clean = wgs_values[~df["wgs_masked"]].dropna()
@@ -151,12 +162,18 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
     wes["wes_masked"] = wes["masked"]
     wgs["wgs_masked"] = wgs["masked"]
 
+    wes = normalize_to_cn_like(wes, "wes_smoothed", "wes_masked")
+    wgs = normalize_to_cn_like(wgs, "wgs_smoothed", "wgs_masked")
+
+    wes["wes_cn_like"] = wes["cn_like"]
+    wgs["wgs_cn_like"] = wgs["cn_like"]
+
     wes_threshold, wgs_threshold, floor_applied = compute_high_thresholds(
         pd.DataFrame({
-            "wes_smoothed": wes["smoothed"],
-            "wgs_smoothed": wgs["smoothed"],
-            "wes_masked": wes["masked"],
-            "wgs_masked": wgs["masked"],
+            "wes_cn_like": wes["wes_cn_like"],
+            "wgs_cn_like": wgs["wgs_cn_like"],
+            "wes_masked": wes["wes_masked"],
+            "wgs_masked": wgs["wgs_masked"],
         }),
         wes_quantile=wes_quantile,
         wgs_quantile=wgs_quantile,
@@ -165,19 +182,22 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
 
     if np.isfinite(wes_threshold):
         wes["wes_threshold"] = wes_threshold
-        wes = high_bin_set(wes, "wes_smoothed", "wes_threshold", "wes_masked")
+        wes = high_bin_set(wes, "wes_cn_like", "wes_threshold", "wes_masked")
     else:
         wes["is_high"] = False
     if np.isfinite(wgs_threshold):
         wgs["wgs_threshold"] = wgs_threshold
-        wgs = high_bin_set(wgs, "wgs_smoothed", "wgs_threshold", "wgs_masked")
+        wgs = high_bin_set(wgs, "wgs_cn_like", "wgs_threshold", "wgs_masked")
     else:
         wgs["is_high"] = False
 
     wes_high = set((str(r["chrom"]), int(r["start"])) for _, r in wes[wes["is_high"]][["chrom", "start"]].iterrows())
     wgs_high = set((str(r["chrom"]), int(r["start"])) for _, r in wgs[wgs["is_high"]][["chrom", "start"]].iterrows())
+    shared_high = wes_high & wgs_high
+    wes_only = wes_high - wgs_high
+    wgs_only = wgs_high - wes_high
 
-    intersection = wes_high & wgs_high
+    intersection = shared_high
     union = wes_high | wgs_high
     n_intersection = len(intersection)
     n_union = len(union)
@@ -206,6 +226,11 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
         "n_union_bins": n_union,
         "jaccard": float(jaccard),
         "overlap_coefficient": float(overlap),
+        "wes_high_bins": wes_high,
+        "wgs_high_bins": wgs_high,
+        "shared_high_bins": shared_high,
+        "wes_only_bins": wes_only,
+        "wgs_only_bins": wgs_only,
     }
 
 
@@ -245,6 +270,10 @@ def main():
     p.add_argument("--outdir", default="wes_wgs_overlap_output", help="Output directory")
     args = p.parse_args()
 
+    default_mask = Path("/home/sspandau/CCLE_WXS/WES2WGS_CCLE/recurrent_amplification_v3_optimization/best_combo_recurrent_orange_overlap.csv")
+    if args.mask_regions is None and default_mask.exists():
+        args.mask_regions = str(default_mask)
+
     wgs_col = args.wgs_column or args.wes_column
     wes_df = prepare_track(load_data(args.wes_input), args.wes_column, args.bin_col, args.chrom_col, args.start_col)
     wgs_df = prepare_track(load_data(args.wgs_input), wgs_col, args.bin_col, args.chrom_col, args.start_col)
@@ -265,10 +294,17 @@ def main():
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    summary = {k: v for k, v in metrics.items() if k not in {"wes_high_bins", "wgs_high_bins", "shared_high_bins", "wes_only_bins", "wgs_only_bins"}}
     outpath = outdir / "wgs_wes_overlap_metrics.tsv"
-    pd.DataFrame([metrics]).to_csv(outpath, sep="\t", index=False)
+    pd.DataFrame([summary]).to_csv(outpath, sep="\t", index=False)
+
+    for name, key in [("wes_high_bins", "wes_high_bins"), ("wgs_high_bins", "wgs_high_bins"), ("shared_high_bins", "shared_high_bins")]:
+        rows = [{"chrom": chrom, "start": start} for chrom, start in sorted(metrics[key], key=lambda x: (x[0], x[1]))]
+        pd.DataFrame(rows).to_csv(outdir / f"{name}.tsv", sep="\t", index=False)
 
     print(f"WES/WGS overlap metrics written to {outpath}")
+    print(f"Shared high bins written to {outdir / 'shared_high_bins.tsv'}")
     print(
         "Jaccard = {jaccard:.4f}, overlap coefficient = {overlap:.4f}, "
         "WES high bins = {wes}, WGS high bins = {wgs}, shared = {shared}".format(
