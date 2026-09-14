@@ -241,11 +241,24 @@ def prepare_track(df, value_col, bin_col=None, chrom_col="chrom", start_col="sta
             raise ValueError(f"Bin column '{bin_col}' not found in input.")
         df = split_bin_column(df, bin_col)
     else:
-        if chrom_col not in df.columns or start_col not in df.columns:
+        chrom_candidates = []
+        if chrom_col:
+            chrom_candidates.append(chrom_col)
+        chrom_candidates.extend(["chrom", "meta_chrom", "chr", "chromosome"])
+        start_candidates = []
+        if start_col:
+            start_candidates.append(start_col)
+        start_candidates.extend(["start", "meta_start", "pos", "position"]) 
+
+        resolved_chrom = next((c for c in chrom_candidates if c in df.columns), None)
+        resolved_start = next((c for c in start_candidates if c in df.columns), None)
+
+        if resolved_chrom is None or resolved_start is None:
             raise ValueError(
-                f"Expected '{chrom_col}' and '{start_col}' columns, or a combined '{bin_col}' column."
+                f"Expected a chromosome/start coordinate pair in the input; tried '{chrom_col}'/'{start_col}' plus common aliases, or a combined '{bin_col}' column. "
+                f"Available columns: {list(df.columns[:20])}."
             )
-        df = df.rename(columns={chrom_col: "chrom", start_col: "start"})
+        df = df.rename(columns={resolved_chrom: "chrom", resolved_start: "start"})
     df["chrom"] = df["chrom"].astype(str)
     df["start"] = df["start"].astype(int)
     df[value_col] = df[value_col].astype(float)
