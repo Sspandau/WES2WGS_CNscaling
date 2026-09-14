@@ -67,8 +67,13 @@ def split_bin_column(df, bin_col):
     return df
 
 
-def smooth_per_chrom(df, value_col, window):
+def smooth_per_chrom(df, value_col, window, mask_col=None):
     df = df.copy()
+    if mask_col is not None:
+        # Exclude masked recurrent bins from the rolling mean so they do not leak into
+        # neighboring WES/WGS smoothed values. Masked bins remain masked later and are
+        # filtered out of the high-bin thresholding step anyway.
+        df[value_col] = df[value_col].where(~df[mask_col], np.nan)
     if window <= 1:
         df["smoothed"] = df[value_col]
         return df
@@ -177,7 +182,7 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
     wes = apply_mask(wes, mask_df)
     wgs = apply_mask(wgs, mask_df)
 
-    wes = smooth_per_chrom(wes, wes_value_col, smooth_window)
+    wes = smooth_per_chrom(wes, wes_value_col, smooth_window, mask_col="masked")
     wgs = smooth_per_chrom(wgs, wgs_value_col, smooth_window)
 
     wes["wes_smoothed"] = wes["smoothed"]
