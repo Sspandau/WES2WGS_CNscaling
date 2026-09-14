@@ -703,6 +703,13 @@ def main():
                 masked_count += sel.sum()
         print(f"Applied mask regions from {args.mask_regions}: marked {int(masked_count)} bins as masked (non-amplified)")
 
+    valid_positive = df.loc[(~df["masked"]) & df["smoothed"].notna() & (df["smoothed"] > 0), "smoothed"]
+    baseline = float(valid_positive.mean()) if not valid_positive.empty else np.nan
+    if np.isfinite(baseline) and baseline > 0:
+        df["cn_like"] = df["smoothed"] / baseline
+    else:
+        df["cn_like"] = df["smoothed"]
+
     compare_wgs_threshold = None
     cn_floor_threshold = None
 
@@ -730,12 +737,19 @@ def main():
             wgs_df = wgs_df.dropna(subset=["value_raw", "start"]).sort_values(["chrom", "start"]).reset_index(drop=True)
             if args.compare_rebin_to is not None:
                 wgs_df = rebin_to_resolution(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", args.compare_rebin_to)
-            wgs_q = float(smooth_per_chrom(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", smooth_window)["smoothed"].quantile(args.compare_wgs_quantile))
+            wgs_s = smooth_per_chrom(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", smooth_window)
+            wgs_q = float(wgs_s["smoothed"].quantile(args.compare_wgs_quantile))
             wes_q = float(df.loc[~df["masked"], "smoothed"].quantile(args.compare_wes_quantile)) if df["masked"].any() else float(df["smoothed"].quantile(args.compare_wes_quantile))
-            if args.cn_floor is not None and wes_q < args.cn_floor:
+            wes_q_cn = float(wes_q / baseline) if np.isfinite(baseline) and baseline > 0 else float("nan")
+            wgs_baseline = float(wgs_s.loc[(wgs_s["smoothed"].notna()) & (wgs_s["smoothed"] > 0), "smoothed"].mean()) if not wgs_s.empty else np.nan
+            wgs_q_cn = float(wgs_q / wgs_baseline) if np.isfinite(wgs_baseline) and wgs_baseline > 0 else float("nan")
+            if args.cn_floor is not None and (
+                (np.isfinite(wes_q_cn) and wes_q_cn < args.cn_floor) or
+                (np.isfinite(wgs_q_cn) and wgs_q_cn < args.cn_floor)
+            ):
                 cn_floor_threshold = float(args.cn_floor)
                 compare_wgs_threshold = float(args.cn_floor)
-                print(f"CN floor applied: WES 0.9 quantile is below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
+                print(f"CN floor applied: WES/WGS q90 CN-like values fell below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
 
     if cn_floor_threshold is not None:
         df, threshold = call_high_bins(df, args.quantile, cn_floor=cn_floor_threshold)
