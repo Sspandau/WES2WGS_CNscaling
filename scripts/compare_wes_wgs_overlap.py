@@ -101,8 +101,10 @@ def normalize_to_cn_like(df, value_col, mask_col):
     denom = float(valid.median()) if not valid.empty else np.nan
     if not np.isfinite(denom) or denom <= 0:
         df["cn_like"] = df[value_col]
+        df["cn_baseline"] = np.nan
     else:
         df["cn_like"] = df[value_col] / denom
+        df["cn_baseline"] = denom
     return df
 
 
@@ -117,15 +119,21 @@ def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
     wgs_q = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
 
     if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and wes_q < cn_floor and wgs_q < cn_floor:
-        wes_threshold = float(cn_floor)
-        wgs_threshold = float(cn_floor)
+        wes_threshold_cn = float(cn_floor)
+        wgs_threshold_cn = float(cn_floor)
         floor_applied = True
     else:
-        wes_threshold = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
-        wgs_threshold = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
+        wes_threshold_cn = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
+        wgs_threshold_cn = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
         floor_applied = False
 
-    return wes_threshold, wgs_threshold, floor_applied
+    wes_raw_baseline = float(df["wes_baseline"].median()) if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() else np.nan
+    wgs_raw_baseline = float(df["wgs_baseline"].median()) if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() else np.nan
+
+    wes_raw_threshold = float(wes_raw_baseline * wes_threshold_cn) if np.isfinite(wes_raw_baseline) else float("nan")
+    wgs_raw_threshold = float(wgs_raw_baseline * wgs_threshold_cn) if np.isfinite(wgs_raw_baseline) else float("nan")
+
+    return wes_threshold_cn, wgs_threshold_cn, wes_raw_threshold, wgs_raw_threshold, floor_applied
 
 
 def high_bin_set(df, value_col, threshold_col, mask_col):
@@ -167,27 +175,33 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
 
     wes["wes_cn_like"] = wes["cn_like"]
     wgs["wgs_cn_like"] = wgs["cn_like"]
+    wes["wes_baseline"] = wes["cn_baseline"]
+    wgs["wgs_baseline"] = wgs["cn_baseline"]
 
-    wes_threshold, wgs_threshold, floor_applied = compute_high_thresholds(
+    wes_threshold_cn, wgs_threshold_cn, wes_raw_threshold, wgs_raw_threshold, floor_applied = compute_high_thresholds(
         pd.DataFrame({
             "wes_cn_like": wes["wes_cn_like"],
             "wgs_cn_like": wgs["wgs_cn_like"],
             "wes_masked": wes["wes_masked"],
             "wgs_masked": wgs["wgs_masked"],
+            "wes_baseline": wes["wes_baseline"],
+            "wgs_baseline": wgs["wgs_baseline"],
         }),
         wes_quantile=wes_quantile,
         wgs_quantile=wgs_quantile,
         cn_floor=cn_floor,
     )
 
-    if np.isfinite(wes_threshold):
-        wes["wes_threshold"] = wes_threshold
-        wes = high_bin_set(wes, "wes_cn_like", "wes_threshold", "wes_masked")
+    if np.isfinite(wes_threshold_cn):
+        wes["wes_threshold_cn"] = wes_threshold_cn
+        wes["wes_threshold_raw"] = wes_raw_threshold
+        wes = high_bin_set(wes, "wes_cn_like", "wes_threshold_cn", "wes_masked")
     else:
         wes["is_high"] = False
-    if np.isfinite(wgs_threshold):
-        wgs["wgs_threshold"] = wgs_threshold
-        wgs = high_bin_set(wgs, "wgs_cn_like", "wgs_threshold", "wgs_masked")
+    if np.isfinite(wgs_threshold_cn):
+        wgs["wgs_threshold_cn"] = wgs_threshold_cn
+        wgs["wgs_threshold_raw"] = wgs_raw_threshold
+        wgs = high_bin_set(wgs, "wgs_cn_like", "wgs_threshold_cn", "wgs_masked")
     else:
         wgs["is_high"] = False
 
@@ -217,8 +231,10 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
         overlap = n_intersection / min(n_wes, n_wgs)
 
     return {
-        "wes_threshold": float(wes_threshold),
-        "wgs_threshold": float(wgs_threshold),
+        "wes_threshold": float(wes_raw_threshold),
+        "wgs_threshold": float(wgs_raw_threshold),
+        "wes_threshold_cn": float(wes_threshold_cn),
+        "wgs_threshold_cn": float(wgs_threshold_cn),
         "cn_floor_applied": bool(floor_applied),
         "n_wes_high_bins": n_wes,
         "n_wgs_high_bins": n_wgs,
@@ -241,11 +257,24 @@ def prepare_track(df, value_col, bin_col=None, chrom_col="chrom", start_col="sta
             raise ValueError(f"Bin column '{bin_col}' not found in input.")
         df = split_bin_column(df, bin_col)
     else:
-        if chrom_col not in df.columns or start_col not in df.columns:
+        chrom_candidates = []
+        if chrom_col:
+            chrom_candidates.append(chrom_col)
+        chrom_candidates.extend(["chrom", "meta_chrom", "chr", "chromosome"])
+        start_candidates = []
+        if start_col:
+            start_candidates.append(start_col)
+        start_candidates.extend(["start", "meta_start", "pos", "position"]) 
+
+        resolved_chrom = next((c for c in chrom_candidates if c in df.columns), None)
+        resolved_start = next((c for c in start_candidates if c in df.columns), None)
+
+        if resolved_chrom is None or resolved_start is None:
             raise ValueError(
-                f"Expected '{chrom_col}' and '{start_col}' columns, or a combined '{bin_col}' column."
+                f"Expected a chromosome/start coordinate pair in the input; tried '{chrom_col}'/'{start_col}' plus common aliases, or a combined '{bin_col}' column. "
+                f"Available columns: {list(df.columns[:20])}."
             )
-        df = df.rename(columns={chrom_col: "chrom", start_col: "start"})
+        df = df.rename(columns={resolved_chrom: "chrom", resolved_start: "start"})
     df["chrom"] = df["chrom"].astype(str)
     df["start"] = df["start"].astype(int)
     df[value_col] = df[value_col].astype(float)
