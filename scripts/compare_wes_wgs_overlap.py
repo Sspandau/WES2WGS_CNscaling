@@ -116,18 +116,15 @@ def normalize_to_cn_like(df, value_col, mask_col):
 
 
 def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
-    wes_values = df["wes_cn_like"]
-    wgs_values = df["wgs_cn_like"]
+    wes_raw_values = df["wes_smoothed"]
+    wgs_raw_values = df["wgs_smoothed"]
 
-    wes_clean = wes_values[~df["wes_masked"]].dropna()
-    wgs_clean = wgs_values[~df["wgs_masked"]].dropna()
+    wes_clean = wes_raw_values[~df["wes_masked"]].dropna()
+    wgs_clean = wgs_raw_values[~df["wgs_masked"]].dropna()
 
-    wes_q = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
-    wgs_q = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
+    wes_q_raw = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
+    wgs_q_raw = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
 
-    # The floor is defined as a CN value (e.g. 3.0) on the normalized CN-like scale.
-    # We compute the corresponding raw threshold afterward by multiplying by the raw
-    # baseline, but the comparison itself must use CN-like units, not raw-depth units.
     wes_raw_baseline = (
         float(df["wes_baseline"].loc[df["wes_baseline"].notna() & (df["wes_baseline"] > 0)].mean())
         if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() and (df["wes_baseline"] > 0).any()
@@ -139,15 +136,21 @@ def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
         else np.nan
     )
 
-    if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and (
-        wes_q < float(cn_floor) or wgs_q < float(cn_floor)
+    wes_q_cn = float(wes_q_raw / wes_raw_baseline) if np.isfinite(wes_q_raw) and np.isfinite(wes_raw_baseline) and wes_raw_baseline > 0 else float("nan")
+    wgs_q_cn = float(wgs_q_raw / wgs_raw_baseline) if np.isfinite(wgs_q_raw) and np.isfinite(wgs_raw_baseline) and wgs_raw_baseline > 0 else float("nan")
+
+    # The quantile is computed on the smoothed depth scale, but the CN-floor comparison is
+    # done on the normalized CN-like scale. If either q90 falls below the CN floor in CN-like
+    # units, apply the CN floor to both tracks.
+    if np.isfinite(wes_q_cn) and np.isfinite(wgs_q_cn) and cn_floor is not None and (
+        wes_q_cn < float(cn_floor) or wgs_q_cn < float(cn_floor)
     ):
         wes_threshold_cn = float(cn_floor)
         wgs_threshold_cn = float(cn_floor)
         floor_applied = True
     else:
-        wes_threshold_cn = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
-        wgs_threshold_cn = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
+        wes_threshold_cn = wes_q_cn
+        wgs_threshold_cn = wgs_q_cn
         floor_applied = False
 
     wes_raw_threshold = float(wes_raw_baseline * wes_threshold_cn) if np.isfinite(wes_raw_baseline) else float("nan")
