@@ -98,7 +98,9 @@ def apply_mask(df, mask_df):
 def normalize_to_cn_like(df, value_col, mask_col):
     df = df.copy()
     valid = df.loc[(~df[mask_col]) & df[value_col].notna(), value_col]
-    denom = float(valid.median()) if not valid.empty else np.nan
+    # Interpret the baseline as the sample diploid mean depth; a CN floor of 3 therefore
+    # corresponds to a raw threshold of 3 * mean_depth.
+    denom = float(valid.mean()) if not valid.empty else np.nan
     if not np.isfinite(denom) or denom <= 0:
         df["cn_like"] = df[value_col]
         df["cn_baseline"] = np.nan
@@ -118,7 +120,19 @@ def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
     wes_q = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
     wgs_q = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
 
-    if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and wes_q < cn_floor and wgs_q < cn_floor:
+    # The floor is defined as 3 * mean depth in raw units. Since wes_q and wgs_q are on the
+    # normalized CN-like scale, the comparison is made against the CN floor in that same scale.
+    wes_raw_baseline = float(df["wes_baseline"].mean()) if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() else np.nan
+    wgs_raw_baseline = float(df["wgs_baseline"].mean()) if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() else np.nan
+    wes_floor_raw = float(wes_raw_baseline * cn_floor) if np.isfinite(wes_raw_baseline) and cn_floor is not None else np.nan
+    wgs_floor_raw = float(wgs_raw_baseline * cn_floor) if np.isfinite(wgs_raw_baseline) and cn_floor is not None else np.nan
+
+    wes_floor_cn = float(wes_floor_raw / wes_raw_baseline) if np.isfinite(wes_raw_baseline) and np.isfinite(wes_floor_raw) and wes_raw_baseline > 0 else np.nan
+    wgs_floor_cn = float(wgs_floor_raw / wgs_raw_baseline) if np.isfinite(wgs_raw_baseline) and np.isfinite(wgs_floor_raw) and wgs_raw_baseline > 0 else np.nan
+
+    if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and (
+        wes_q < wes_floor_cn or wgs_q < wgs_floor_cn
+    ):
         wes_threshold_cn = float(cn_floor)
         wgs_threshold_cn = float(cn_floor)
         floor_applied = True
@@ -126,9 +140,6 @@ def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
         wes_threshold_cn = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
         wgs_threshold_cn = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
         floor_applied = False
-
-    wes_raw_baseline = float(df["wes_baseline"].median()) if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() else np.nan
-    wgs_raw_baseline = float(df["wgs_baseline"].median()) if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() else np.nan
 
     wes_raw_threshold = float(wes_raw_baseline * wes_threshold_cn) if np.isfinite(wes_raw_baseline) else float("nan")
     wgs_raw_threshold = float(wgs_raw_baseline * wgs_threshold_cn) if np.isfinite(wgs_raw_baseline) else float("nan")
