@@ -201,15 +201,8 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
     wes["wes_baseline"] = wes["cn_baseline"]
     wgs["wgs_baseline"] = wgs["cn_baseline"]
 
-    # Keep the current smoothed CN-like thresholding logic for quantile/floor estimation,
-    # but use the original per-bin WES loess-scaled depth for the final high-bin flag.
-    wes["wes_original_value"] = wes[wes_value_col].astype(float)
-    wes["wes_original_cn_like"] = np.where(
-        wes["wes_baseline"].notna() & (wes["wes_baseline"] > 0),
-        wes["wes_original_value"] / wes["wes_baseline"],
-        np.nan,
-    )
-
+    # Use the smoothed WES values for the final high-bin flag, while keeping the CN-like
+    # normalization for the quantile-based threshold and CN-floor fallback check.
     wes_threshold_cn, wgs_threshold_cn, wes_raw_threshold, wgs_raw_threshold, floor_applied = compute_high_thresholds(
         pd.DataFrame({
             "wes_cn_like": wes["wes_cn_like"],
@@ -227,7 +220,7 @@ def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
     if np.isfinite(wes_threshold_cn):
         wes["wes_threshold_cn"] = wes_threshold_cn
         wes["wes_threshold_raw"] = wes_raw_threshold
-        wes = high_bin_set(wes, "wes_original_cn_like", "wes_threshold_cn", "wes_masked")
+        wes = high_bin_set(wes, "wes_cn_like", "wes_threshold_cn", "wes_masked")
     else:
         wes["is_high"] = False
     if np.isfinite(wgs_threshold_cn):
