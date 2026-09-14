@@ -34,7 +34,7 @@ find_matching_wgs_file() {
         dir_name="$(basename "$dir")"
         if [ "$(normalize_name "$dir_name")" = "$norm_sample" ]; then
             local candidate
-            candidate=$(find "$dir" -type f \( -name "*.csv" -o -name "*.tsv" -o -name "*.txt" \) 2>/dev/null | head -n 1)
+            candidate=$(find "$dir" -type f -name "*_off_target_copy_ratios.tsv" 2>/dev/null | head -n 1)
             if [ -n "$candidate" ] && [ -f "$candidate" ]; then
                 printf '%s\n' "$candidate"
                 return 0
@@ -53,8 +53,9 @@ for SAMPLE_DIR in "$WES_ROOT"/*/; do
     fi
 
     SAMPLE=$(basename "$SAMPLE_DIR")
-    WES_INPUT=$(find "$SAMPLE_DIR" -maxdepth 1 -type f \( -name "*_off_target_copy_ratios.tsv" -o -name "*.tsv" -o -name "*.csv" \) | head -n 1)
+    WES_INPUT=$(find "$SAMPLE_DIR" -maxdepth 1 -type f -name "*_off_target_copy_ratios.tsv" | head -n 1)
     if [ -z "$WES_INPUT" ] || [ ! -f "$WES_INPUT" ]; then
+        echo "[skip] no off-target copy-ratio file for sample '${SAMPLE}'; skipping."
         continue
     fi
 

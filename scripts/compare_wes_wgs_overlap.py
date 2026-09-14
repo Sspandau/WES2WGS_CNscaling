@@ -97,9 +97,9 @@ def apply_mask(df, mask_df):
 
 def normalize_to_cn_like(df, value_col, mask_col):
     df = df.copy()
-    valid = df.loc[(~df[mask_col]) & df[value_col].notna(), value_col]
-    # Interpret the baseline as the sample diploid mean depth; a CN floor of 3 therefore
-    # corresponds to a raw threshold of 3 * mean_depth.
+    valid = df.loc[(~df[mask_col]) & df[value_col].notna() & (df[value_col] > 0), value_col]
+    # Interpret the baseline as the sample diploid mean depth for positive bins; a CN floor of
+    # 3 therefore corresponds to a raw threshold of 3 * mean_depth.
     denom = float(valid.mean()) if not valid.empty else np.nan
     if not np.isfinite(denom) or denom <= 0:
         df["cn_like"] = df[value_col]

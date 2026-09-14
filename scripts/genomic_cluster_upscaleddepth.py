@@ -228,7 +228,7 @@ def compute_binarized_overlap_metrics(wes_df, wgs_df, wes_value_col="value_raw",
     wes_q = float(wes_proc["smoothed"].quantile(wes_quantile))
     wgs_q = float(wgs_proc["smoothed"].quantile(wgs_quantile))
 
-    if cn_floor is not None and wes_q < cn_floor and wgs_q < cn_floor:
+    if cn_floor is not None and wes_q < cn_floor:
         wes_threshold = float(cn_floor)
         wgs_threshold = float(cn_floor)
         wes_proc["is_high"] = wes_proc["smoothed"] > wes_threshold
@@ -643,7 +643,7 @@ def main():
     p.add_argument("--compare-rebin-to", type=int, default=None,
                    help="Optional resolution in bp to harmonize both tracks before computing the metric")
     p.add_argument("--cn-floor", type=float, default=3.0,
-                   help="Absolute copy-number floor for 'high' bins: if both WES and WGS 0.9 quantiles are below this value, use this threshold instead (default: 3.0)")
+                   help="Absolute copy-number floor for 'high' bins: if the WES 0.9 quantile is below this value, use this threshold instead (default: 3.0)")
     args = p.parse_args()
 
     outdir = Path(args.outdir)
@@ -732,10 +732,10 @@ def main():
                 wgs_df = rebin_to_resolution(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", args.compare_rebin_to)
             wgs_q = float(smooth_per_chrom(wgs_df[["chrom", "start", "value_raw"]].copy(), "value_raw", smooth_window)["smoothed"].quantile(args.compare_wgs_quantile))
             wes_q = float(df.loc[~df["masked"], "smoothed"].quantile(args.compare_wes_quantile)) if df["masked"].any() else float(df["smoothed"].quantile(args.compare_wes_quantile))
-            if args.cn_floor is not None and wes_q < args.cn_floor and wgs_q < args.cn_floor:
+            if args.cn_floor is not None and wes_q < args.cn_floor:
                 cn_floor_threshold = float(args.cn_floor)
                 compare_wgs_threshold = float(args.cn_floor)
-                print(f"CN floor applied: both WES and WGS 0.9 quantiles are below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
+                print(f"CN floor applied: WES 0.9 quantile is below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
 
     if cn_floor_threshold is not None:
         df, threshold = call_high_bins(df, args.quantile, cn_floor=cn_floor_threshold)
