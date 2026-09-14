@@ -120,18 +120,22 @@ def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
     wes_q = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
     wgs_q = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
 
-    # The floor is defined as 3 * mean depth in raw units. Since wes_q and wgs_q are on the
-    # normalized CN-like scale, the comparison is made against the CN floor in that same scale.
-    wes_raw_baseline = float(df["wes_baseline"].mean()) if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() else np.nan
-    wgs_raw_baseline = float(df["wgs_baseline"].mean()) if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() else np.nan
-    wes_floor_raw = float(wes_raw_baseline * cn_floor) if np.isfinite(wes_raw_baseline) and cn_floor is not None else np.nan
-    wgs_floor_raw = float(wgs_raw_baseline * cn_floor) if np.isfinite(wgs_raw_baseline) and cn_floor is not None else np.nan
-
-    wes_floor_cn = float(wes_floor_raw / wes_raw_baseline) if np.isfinite(wes_raw_baseline) and np.isfinite(wes_floor_raw) and wes_raw_baseline > 0 else np.nan
-    wgs_floor_cn = float(wgs_floor_raw / wgs_raw_baseline) if np.isfinite(wgs_raw_baseline) and np.isfinite(wgs_floor_raw) and wgs_raw_baseline > 0 else np.nan
+    # The floor is defined as a CN value (e.g. 3.0) on the normalized CN-like scale.
+    # We compute the corresponding raw threshold afterward by multiplying by the raw
+    # baseline, but the comparison itself must use CN-like units, not raw-depth units.
+    wes_raw_baseline = (
+        float(df["wes_baseline"].loc[df["wes_baseline"].notna() & (df["wes_baseline"] > 0)].mean())
+        if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() and (df["wes_baseline"] > 0).any()
+        else np.nan
+    )
+    wgs_raw_baseline = (
+        float(df["wgs_baseline"].loc[df["wgs_baseline"].notna() & (df["wgs_baseline"] > 0)].mean())
+        if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() and (df["wgs_baseline"] > 0).any()
+        else np.nan
+    )
 
     if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and (
-        wes_q < wes_floor_cn or wgs_q < wgs_floor_cn
+        wes_q < float(cn_floor) or wgs_q < float(cn_floor)
     ):
         wes_threshold_cn = float(cn_floor)
         wgs_threshold_cn = float(cn_floor)
