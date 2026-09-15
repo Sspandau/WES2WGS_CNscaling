@@ -190,11 +190,12 @@ def smooth_per_chrom(df, value_col, window):
     return df
 
 
-def call_high_bins(df, quantile, cn_floor=None):
-    threshold = df["smoothed"].quantile(quantile)
+def call_high_bins(df, quantile, cn_floor=None, value_col=None):
+    value_col = value_col or ("cn_like" if "cn_like" in df.columns else "smoothed")
+    threshold = df[value_col].quantile(quantile)
     if cn_floor is not None:
         threshold = max(float(threshold), float(cn_floor))
-    df["is_high"] = df["smoothed"] > threshold
+    df["is_high"] = df[value_col] > threshold
     return df, threshold
 
 
@@ -759,7 +760,8 @@ def main():
     # Ensure masked bins are not considered 'high' after thresholding.
     if args.mask_regions is not None:
         df.loc[df["masked"], "is_high"] = False
-    print(f"'High' threshold (quantile {args.quantile}) on smoothed values: {threshold:.4f}")
+    value_for_threshold = "cn_like" if "cn_like" in df.columns else "smoothed"
+    print(f"'High' threshold (quantile {args.quantile}) on {value_for_threshold} values: {threshold:.4f}")
     print(f"Bins above threshold: {df['is_high'].sum()} / {len(df)}")
 
     max_gap_by_chrom = resolve_max_gap(df, "value_raw", args.max_gap, args.max_gap_search_lags)
