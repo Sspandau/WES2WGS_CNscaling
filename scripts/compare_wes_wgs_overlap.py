@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
-"""Compute a binarized WES-vs-WGS overlap score. The script:
+"""Minimal WES/WGS amplification-threshold search.
 
-1. loads WES and WGS bin-level tracks,
-2. smooths both within chromosome,
-3. applies an optional recurrent-bin mask,
-4. thresholds high bins at either the requested quantile or a CN floor,
-5. computes Jaccard similarity and overlap coefficient,
-6. writes a TSV summary.
+This script is intentionally lightweight:
 
-The fallback logic is:
-- if the filtered WES q90 and the WGS q90 are both below --cn-floor,
-  then the effective threshold becomes --cn-floor for both tracks.
-- bins in mask regions are excluded from this decision and are forced to
-  non-high before clustering/overlap is computed.
+1. load WES and WGS bin-level tracks
+2. average smaller bins into 25kb bins
+3. align WES and WGS on chrom/start
+4. evaluate a grid of amplification thresholds for Jaccard and overlap
+5. repeat the search in a CN-like space defined as value / mean(value on positive bins)
+6. write TSVs and plots highlighting the best threshold pair
+
+No smoothing is used anywhere.
 """
 
 import argparse
-import re
-import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-
-BIN_COL_PATTERN = re.compile(
-    r"^\s*(?P<chrom>chr[\w]+|[0-9XYMxym]+)\s*[:_\-]\s*"
-    r"(?P<start>\d+)\s*[:_\-]\s*(?P<end>\d+)?\s*$"
-)
 
 
 def load_data(path):
@@ -35,25 +28,10 @@ def load_data(path):
     return pd.read_csv(path, sep=sep, engine="python")
 
 
-def load_mask_regions(path):
-    m = load_data(path)
-    cols = {c.lower(): c for c in m.columns}
-    if "chrom" in cols and "start" in cols and "end" in cols:
-        m = m.rename(columns={cols["chrom"]: "chrom", cols["start"]: "start", cols["end"]: "end"})
-    else:
-        if m.shape[1] < 3:
-            raise ValueError("Mask regions file must have at least three columns: chrom,start,end")
-        first_three = m.columns[:3]
-        m = m.rename(columns={first_three[0]: "chrom", first_three[1]: "start", first_three[2]: "end"})
-    m = m[["chrom", "start", "end"]].copy()
-    m["chrom"] = m["chrom"].astype(str)
-    m["start"] = m["start"].astype(int)
-    m["end"] = m["end"].astype(int)
-    return m
-
-
 def split_bin_column(df, bin_col):
-    parsed = df[bin_col].astype(str).str.extract(BIN_COL_PATTERN)
+    parsed = df[bin_col].astype(str).str.extract(
+        r"^\s*(?P<chrom>chr[\w]+|[0-9XYMxym]+)\s*[:_\-]\s*(?P<start>\d+)\s*[:_\-]\s*(?P<end>\d+)?\s*$"
+    )
     if parsed["chrom"].isna().any():
         bad = df.loc[parsed["chrom"].isna(), bin_col].head(3).tolist()
         raise ValueError(
@@ -63,307 +41,234 @@ def split_bin_column(df, bin_col):
     df = df.copy()
     df["chrom"] = parsed["chrom"]
     df["start"] = parsed["start"].astype(int)
-    df["end"] = parsed["end"].astype(float)
     return df
 
 
-def smooth_per_chrom(df, value_col, window, mask_col=None):
+def prepare_track(df, value_col, bin_col=None, chrom_col="chrom", start_col="start"):
     df = df.copy()
-    if mask_col is not None:
-        # Exclude masked recurrent bins from the rolling mean so they do not leak into
-        # neighboring WES/WGS smoothed values. Masked bins remain masked later and are
-        # filtered out of the high-bin thresholding step anyway.
-        df[value_col] = df[value_col].where(~df[mask_col], np.nan)
-    if window <= 1:
-        df["smoothed"] = df[value_col]
+    if bin_col is not None:
+        if bin_col not in df.columns:
+            raise ValueError(f"Bin column '{bin_col}' not found in input.")
+        df = split_bin_column(df, bin_col)
+    else:
+        chrom_candidates = [chrom_col, "chrom", "meta_chrom", "chr", "chromosome"]
+        start_candidates = [start_col, "start", "meta_start", "pos", "position"]
+        resolved_chrom = next((c for c in chrom_candidates if c in df.columns), None)
+        resolved_start = next((c for c in start_candidates if c in df.columns), None)
+        if resolved_chrom is None or resolved_start is None:
+            raise ValueError(
+                "Could not resolve chromosome/start columns. "
+                f"Available columns: {list(df.columns[:20])}."
+            )
+        df = df.rename(columns={resolved_chrom: "chrom", resolved_start: "start"})
+
+    df["chrom"] = df["chrom"].astype(str)
+    df["start"] = df["start"].astype(int)
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    return df.dropna(subset=["chrom", "start", value_col]).sort_values(["chrom", "start"]).reset_index(drop=True)
+
+
+def rebin_track(df, value_col, target_bin_size=25000):
+    df = df.copy()
+    if target_bin_size is None or target_bin_size <= 0:
         return df
-    df["smoothed"] = (
-        df.groupby("chrom", group_keys=False)[value_col]
-        .apply(lambda s: s.rolling(window, center=True, min_periods=1).mean())
+    df["bin_start"] = (df["start"] // target_bin_size) * target_bin_size
+    rebinned = (
+        df.groupby(["chrom", "bin_start"], as_index=False)[value_col]
+        .mean()
+        .rename(columns={"bin_start": "start"})
+        .sort_values(["chrom", "start"])
+        .reset_index(drop=True)
     )
-    return df
+    return rebinned
 
 
-def apply_mask(df, mask_df):
-    df = df.copy()
-    df["masked"] = False
-    if mask_df is None or mask_df.empty:
-        return df
-
-    for _, row in mask_df.iterrows():
-        chrom = str(row["chrom"])
-        start = int(row["start"])
-        end = int(row["end"])
-        sel = (df["chrom"] == chrom) & (df["start"] >= start) & (df["start"] < end)
-        if sel.any():
-            df.loc[sel, "masked"] = True
-    return df
-
-
-def normalize_to_cn_like(df, value_col, mask_col):
-    df = df.copy()
-    valid = df.loc[(~df[mask_col]) & df[value_col].notna() & (df[value_col] > 0), value_col]
-    # Interpret the baseline as the sample diploid mean depth for positive bins; a CN floor of
-    # 3 therefore corresponds to a raw threshold of 3 * mean_depth.
-    denom = float(valid.mean()) if not valid.empty else np.nan
-    if not np.isfinite(denom) or denom <= 0:
-        df["cn_like"] = df[value_col]
-        df["cn_baseline"] = np.nan
-    else:
-        df["cn_like"] = df[value_col] / denom
-        df["cn_baseline"] = denom
-    return df
-
-
-def compute_high_thresholds(df, wes_quantile, wgs_quantile, cn_floor):
-    wes_values = df["wes_cn_like"]
-    wgs_values = df["wgs_cn_like"]
-
-    wes_clean = wes_values[~df["wes_masked"]].dropna()
-    wgs_clean = wgs_values[~df["wgs_masked"]].dropna()
-
-    wes_q = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
-    wgs_q = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
-
-    # The floor is defined as a CN value (e.g. 3.0) on the normalized CN-like scale.
-    # We compute the corresponding raw threshold afterward by multiplying by the raw
-    # baseline, but the comparison itself must use CN-like units, not raw-depth units.
-    wes_raw_baseline = (
-        float(df["wes_baseline"].loc[df["wes_baseline"].notna() & (df["wes_baseline"] > 0)].mean())
-        if "wes_baseline" in df.columns and df["wes_baseline"].notna().any() and (df["wes_baseline"] > 0).any()
-        else np.nan
+def align_tracks(wes_df, wgs_df, wes_col, wgs_col):
+    merged = wes_df[["chrom", "start", wes_col]].rename(columns={wes_col: "wes_value"}).merge(
+        wgs_df[["chrom", "start", wgs_col]].rename(columns={wgs_col: "wgs_value"}),
+        on=["chrom", "start"],
+        how="outer",
     )
-    wgs_raw_baseline = (
-        float(df["wgs_baseline"].loc[df["wgs_baseline"].notna() & (df["wgs_baseline"] > 0)].mean())
-        if "wgs_baseline" in df.columns and df["wgs_baseline"].notna().any() and (df["wgs_baseline"] > 0).any()
-        else np.nan
-    )
-
-    if np.isfinite(wes_q) and np.isfinite(wgs_q) and cn_floor is not None and (
-        wes_q < float(cn_floor) or wgs_q < float(cn_floor)
-    ):
-        wes_threshold_cn = float(cn_floor)
-        wgs_threshold_cn = float(cn_floor)
-        floor_applied = True
-    else:
-        wes_threshold_cn = float(wes_clean.quantile(wes_quantile)) if not wes_clean.empty else float("nan")
-        wgs_threshold_cn = float(wgs_clean.quantile(wgs_quantile)) if not wgs_clean.empty else float("nan")
-        floor_applied = False
-
-    wes_raw_threshold = float(wes_raw_baseline * wes_threshold_cn) if np.isfinite(wes_raw_baseline) else float("nan")
-    wgs_raw_threshold = float(wgs_raw_baseline * wgs_threshold_cn) if np.isfinite(wgs_raw_baseline) else float("nan")
-
-    return wes_threshold_cn, wgs_threshold_cn, wes_raw_threshold, wgs_raw_threshold, floor_applied
+    merged["wes_value"] = pd.to_numeric(merged["wes_value"], errors="coerce")
+    merged["wgs_value"] = pd.to_numeric(merged["wgs_value"], errors="coerce")
+    return merged.sort_values(["chrom", "start"]).reset_index(drop=True)
 
 
-def high_bin_set(df, value_col, threshold_col, mask_col):
-    df = df.copy()
-    df["is_high"] = False
-    sel = (~df[mask_col]) & (df[value_col] > df[threshold_col])
-    df.loc[sel, "is_high"] = True
-    return df
+def cn_like_from_track(series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    s_pos = s[s > 0]
+    denom = float(s_pos.mean()) if not s_pos.empty else np.nan
+    if np.isfinite(denom) and denom > 0:
+        return series / denom
+    return series
 
 
-def compute_overlap_metrics(wes_df, wgs_df, wes_value_col, wgs_value_col,
-                           wes_quantile=0.90, wgs_quantile=0.90,
-                           smooth_window=5, rebin_to=None, cn_floor=3.0,
-                           mask_df=None):
-    wes = wes_df.copy()
-    wgs = wgs_df.copy()
+def make_cn_like_version(df, wes_col="wes_value", wgs_col="wgs_value"):
+    out = df.copy()
+    out["wes_cn_like"] = cn_like_from_track(out[wes_col])
+    out["wgs_cn_like"] = cn_like_from_track(out[wgs_col])
+    return out
 
-    if rebin_to is not None:
-        wes = wes[["chrom", "start", wes_value_col]].copy()
-        wgs = wgs[["chrom", "start", wgs_value_col]].copy()
-        wes = wes.groupby("chrom", group_keys=False).apply(lambda x: x.assign(start=(x["start"] // rebin_to) * rebin_to))
-        wgs = wgs.groupby("chrom", group_keys=False).apply(lambda x: x.assign(start=(x["start"] // rebin_to) * rebin_to))
-        wes = wes.groupby(["chrom", "start"], as_index=False)[wes_value_col].mean()
-        wgs = wgs.groupby(["chrom", "start"], as_index=False)[wgs_value_col].mean()
 
-    wes = apply_mask(wes, mask_df)
-    wgs = apply_mask(wgs, mask_df)
+def threshold_grid(values, n_points=60):
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return np.array([0.0])
+    lo = float(values.min())
+    hi = float(values.max())
+    if np.isclose(lo, hi):
+        return np.array([lo])
+    qs = np.linspace(0.0, 1.0, n_points)
+    grid = np.quantile(values, qs)
+    grid = np.unique(np.round(grid, 12))
+    return grid.astype(float)
 
-    wes = smooth_per_chrom(wes, wes_value_col, smooth_window, mask_col="masked")
-    wgs = smooth_per_chrom(wgs, wgs_value_col, smooth_window)
 
-    wes["wes_smoothed"] = wes["smoothed"]
-    wgs["wgs_smoothed"] = wgs["smoothed"]
-    wes["wes_masked"] = wes["masked"]
-    wgs["wgs_masked"] = wgs["masked"]
-
-    wes = normalize_to_cn_like(wes, "wes_smoothed", "wes_masked")
-    wgs = normalize_to_cn_like(wgs, "wgs_smoothed", "wgs_masked")
-
-    wes["wes_cn_like"] = wes["cn_like"]
-    wgs["wgs_cn_like"] = wgs["cn_like"]
-    wes["wes_baseline"] = wes["cn_baseline"]
-    wgs["wgs_baseline"] = wgs["cn_baseline"]
-
-    wes_threshold_cn, wgs_threshold_cn, wes_raw_threshold, wgs_raw_threshold, floor_applied = compute_high_thresholds(
-        pd.DataFrame({
-            "wes_cn_like": wes["wes_cn_like"],
-            "wgs_cn_like": wgs["wgs_cn_like"],
-            "wes_masked": wes["wes_masked"],
-            "wgs_masked": wgs["wgs_masked"],
-            "wes_baseline": wes["wes_baseline"],
-            "wgs_baseline": wgs["wgs_baseline"],
-        }),
-        wes_quantile=wes_quantile,
-        wgs_quantile=wgs_quantile,
-        cn_floor=cn_floor,
-    )
-
-    if np.isfinite(wes_threshold_cn):
-        wes["wes_threshold_cn"] = wes_threshold_cn
-        wes["wes_threshold_raw"] = wes_raw_threshold
-        wes = high_bin_set(wes, "wes_cn_like", "wes_threshold_cn", "wes_masked")
-    else:
-        wes["is_high"] = False
-    if np.isfinite(wgs_threshold_cn):
-        wgs["wgs_threshold_cn"] = wgs_threshold_cn
-        wgs["wgs_threshold_raw"] = wgs_raw_threshold
-        wgs = high_bin_set(wgs, "wgs_cn_like", "wgs_threshold_cn", "wgs_masked")
-    else:
-        wgs["is_high"] = False
-
-    wes_high = set((str(r["chrom"]), int(r["start"])) for _, r in wes[wes["is_high"]][["chrom", "start"]].iterrows())
-    wgs_high = set((str(r["chrom"]), int(r["start"])) for _, r in wgs[wgs["is_high"]][["chrom", "start"]].iterrows())
-    shared_high = wes_high & wgs_high
-    wes_only = wes_high - wgs_high
-    wgs_only = wgs_high - wes_high
-
-    intersection = shared_high
+def compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
+    wes_high = set(np.where(wes_vals > wes_thresh)[0].tolist())
+    wgs_high = set(np.where(wgs_vals > wgs_thresh)[0].tolist())
+    shared = wes_high & wgs_high
     union = wes_high | wgs_high
-    n_intersection = len(intersection)
+
+    n_inter = len(shared)
     n_union = len(union)
     n_wes = len(wes_high)
     n_wgs = len(wgs_high)
 
     if n_union == 0:
-        jaccard = 1.0 if n_intersection == 0 else 0.0
+        jaccard = 1.0 if n_inter == 0 else 0.0
     else:
-        jaccard = n_intersection / n_union
+        jaccard = n_inter / n_union
 
     if n_wes == 0 and n_wgs == 0:
         overlap = 1.0
     elif min(n_wes, n_wgs) == 0:
         overlap = 0.0
     else:
-        overlap = n_intersection / min(n_wes, n_wgs)
+        overlap = n_inter / min(n_wes, n_wgs)
 
     return {
-        "wes_threshold": float(wes_raw_threshold),
-        "wgs_threshold": float(wgs_raw_threshold),
-        "wes_threshold_cn": float(wes_threshold_cn),
-        "wgs_threshold_cn": float(wgs_threshold_cn),
-        "cn_floor_applied": bool(floor_applied),
-        "n_wes_high_bins": n_wes,
-        "n_wgs_high_bins": n_wgs,
-        "n_intersection_bins": n_intersection,
-        "n_union_bins": n_union,
+        "wes_threshold": float(wes_thresh),
+        "wgs_threshold": float(wgs_thresh),
         "jaccard": float(jaccard),
         "overlap_coefficient": float(overlap),
-        "wes_high_bins": wes_high,
-        "wgs_high_bins": wgs_high,
-        "shared_high_bins": shared_high,
-        "wes_only_bins": wes_only,
-        "wgs_only_bins": wgs_only,
+        "n_wes_high_bins": int(n_wes),
+        "n_wgs_high_bins": int(n_wgs),
+        "n_intersection_bins": int(n_inter),
+        "n_union_bins": int(n_union),
     }
 
 
-def prepare_track(df, value_col, bin_col=None, chrom_col="chrom", start_col="start"):
-    df = df.copy()
-    if bin_col:
-        if bin_col not in df.columns:
-            raise ValueError(f"Bin column '{bin_col}' not found in input.")
-        df = split_bin_column(df, bin_col)
-    else:
-        chrom_candidates = []
-        if chrom_col:
-            chrom_candidates.append(chrom_col)
-        chrom_candidates.extend(["chrom", "meta_chrom", "chr", "chromosome"])
-        start_candidates = []
-        if start_col:
-            start_candidates.append(start_col)
-        start_candidates.extend(["start", "meta_start", "pos", "position"]) 
+def search_threshold_grid(df, wes_col, wgs_col, n_points=60):
+    wes_vals = pd.to_numeric(df[wes_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
+    wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
 
-        resolved_chrom = next((c for c in chrom_candidates if c in df.columns), None)
-        resolved_start = next((c for c in start_candidates if c in df.columns), None)
+    wes_thresholds = threshold_grid(df[wes_col], n_points=n_points)
+    wgs_thresholds = threshold_grid(df[wgs_col], n_points=n_points)
 
-        if resolved_chrom is None or resolved_start is None:
-            raise ValueError(
-                f"Expected a chromosome/start coordinate pair in the input; tried '{chrom_col}'/'{start_col}' plus common aliases, or a combined '{bin_col}' column. "
-                f"Available columns: {list(df.columns[:20])}."
-            )
-        df = df.rename(columns={resolved_chrom: "chrom", resolved_start: "start"})
-    df["chrom"] = df["chrom"].astype(str)
-    df["start"] = df["start"].astype(int)
-    df[value_col] = df[value_col].astype(float)
-    return df.dropna(subset=["chrom", "start", value_col]).sort_values(["chrom", "start"]).reset_index(drop=True)
+    rows = []
+    for wes_thresh in wes_thresholds:
+        for wgs_thresh in wgs_thresholds:
+            rows.append(compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh))
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(["wes_threshold", "wgs_threshold"]).reset_index(drop=True)
+
+
+def best_row(df, metric):
+    if df.empty:
+        raise ValueError("No threshold grid results found.")
+    i = df[metric].idxmax()
+    return df.loc[i].to_dict()
+
+
+def plot_threshold_grid(df, outpath, metric, title):
+    table = df.pivot(index="wes_threshold", columns="wgs_threshold", values=metric)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    image = ax.imshow(table.to_numpy(), origin="lower", aspect="auto", cmap="viridis")
+
+    best = df.loc[df[metric].idxmax()]
+    y_idx = np.argmin(np.abs(table.index.to_numpy() - best["wes_threshold"]))
+    x_idx = np.argmin(np.abs(table.columns.to_numpy() - best["wgs_threshold"]))
+    ax.plot(x_idx, y_idx, "o", color="red", markersize=7, label="best")
+    ax.set_title(title)
+    ax.set_xlabel("WGS threshold")
+    ax.set_ylabel("WES threshold")
+    fig.colorbar(image, ax=ax, label=metric)
+    ax.legend(frameon=False)
+
+    if table.shape[1] > 1:
+        xticks = np.linspace(0, table.shape[1] - 1, min(5, table.shape[1]), dtype=int)
+        ax.set_xticks(xticks)
+        ax.set_xticklabels([f"{table.columns[i]:.3f}" for i in xticks], rotation=45, ha="right")
+    if table.shape[0] > 1:
+        yticks = np.linspace(0, table.shape[0] - 1, min(5, table.shape[0]), dtype=int)
+        ax.set_yticks(yticks)
+        ax.set_yticklabels([f"{table.index[i]:.3f}" for i in yticks])
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--wes-input", required=True, help="Path to WES bin-level TSV/CSV")
-    p.add_argument("--wes-column", required=True, help="Column with WES values")
-    p.add_argument("--wgs-input", required=True, help="Path to WGS bin-level TSV/CSV")
-    p.add_argument("--wgs-column", default=None, help="Column with WGS values (defaults to the WES column name)")
-    p.add_argument("--bin-col", default=None, help="Combined bin column like 'chr1:1000-2000'")
-    p.add_argument("--chrom-col", default="chrom", help="Chromosome column name")
-    p.add_argument("--start-col", default="start", help="Start position column name")
-    p.add_argument("--rebin-to", type=int, default=None, help="Optional rebinning size in bp")
-    p.add_argument("--smooth-window", type=int, default=5, help="Rolling smoothing window in bins")
-    p.add_argument("--wes-quantile", type=float, default=0.90, help="WES threshold quantile")
-    p.add_argument("--wgs-quantile", type=float, default=0.90, help="WGS threshold quantile")
-    p.add_argument("--cn-floor", type=float, default=3.0, help="Copy-number floor applied when both q90 values are below this value")
-    p.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of recurrent bins to mask/gap regions")
-    p.add_argument("--outdir", default="wes_wgs_overlap_output", help="Output directory")
-    args = p.parse_args()
-
-    default_mask = Path("/home/sspandau/CCLE_WXS/WES2WGS_CCLE/recurrent_amplification_v3_optimization/best_combo_recurrent_orange_overlap.csv")
-    if args.mask_regions is None and default_mask.exists():
-        args.mask_regions = str(default_mask)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wes-input", required=True, help="WES copy-ratio or loess-depth TSV/CSV")
+    parser.add_argument("--wes-column", required=True, help="WES value column")
+    parser.add_argument("--wgs-input", required=True, help="WGS tumor-depth TSV/CSV")
+    parser.add_argument("--wgs-column", default=None, help="WGS value column; defaults to the WES column name")
+    parser.add_argument("--bin-col", default=None, help="Combined bin column like 'chr1:1000-2000'")
+    parser.add_argument("--chrom-col", default="chrom", help="Chromosome column name")
+    parser.add_argument("--start-col", default="start", help="Start coordinate column")
+    parser.add_argument("--target-bin-size", type=int, default=25000, help="Final bin size in bp for comparison")
+    parser.add_argument("--search-grid", type=int, default=60, help="Number of thresholds to evaluate per track")
+    parser.add_argument("--outdir", default="wes_wgs_overlap_output", help="Output directory")
+    args = parser.parse_args()
 
     wgs_col = args.wgs_column or args.wes_column
+
     wes_df = prepare_track(load_data(args.wes_input), args.wes_column, args.bin_col, args.chrom_col, args.start_col)
     wgs_df = prepare_track(load_data(args.wgs_input), wgs_col, args.bin_col, args.chrom_col, args.start_col)
 
-    mask_df = load_mask_regions(args.mask_regions) if args.mask_regions else None
-    metrics = compute_overlap_metrics(
-        wes_df,
-        wgs_df,
-        wes_value_col=args.wes_column,
-        wgs_value_col=wgs_col,
-        wes_quantile=args.wes_quantile,
-        wgs_quantile=args.wgs_quantile,
-        smooth_window=args.smooth_window,
-        rebin_to=args.rebin_to,
-        cn_floor=args.cn_floor,
-        mask_df=mask_df,
-    )
+    wes_df = rebin_track(wes_df, args.wes_column, target_bin_size=args.target_bin_size)
+    wgs_df = rebin_track(wgs_df, wgs_col, target_bin_size=args.target_bin_size)
+
+    aligned = align_tracks(wes_df, wgs_df, args.wes_column, wgs_col)
+
+    raw_results = search_threshold_grid(aligned, "wes_value", "wgs_value", n_points=args.search_grid)
+    cn_like_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
+    cn_results = search_threshold_grid(cn_like_df, "wes_cn_like", "wgs_cn_like", n_points=args.search_grid)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    summary = {k: v for k, v in metrics.items() if k not in {"wes_high_bins", "wgs_high_bins", "shared_high_bins", "wes_only_bins", "wgs_only_bins"}}
-    outpath = outdir / "wgs_wes_overlap_metrics.tsv"
-    pd.DataFrame([summary]).to_csv(outpath, sep="\t", index=False)
+    raw_results.to_csv(outdir / "threshold_grid_raw.tsv", sep="\t", index=False)
+    cn_results.to_csv(outdir / "threshold_grid_cn_like.tsv", sep="\t", index=False)
 
-    for name, key in [("wes_high_bins", "wes_high_bins"), ("wgs_high_bins", "wgs_high_bins"), ("shared_high_bins", "shared_high_bins")]:
-        rows = [{"chrom": chrom, "start": start} for chrom, start in sorted(metrics[key], key=lambda x: (x[0], x[1]))]
-        pd.DataFrame(rows).to_csv(outdir / f"{name}.tsv", sep="\t", index=False)
+    plot_threshold_grid(raw_results, outdir / "jaccard_raw.png", "jaccard", "Raw amplification search: Jaccard")
+    plot_threshold_grid(raw_results, outdir / "overlap_raw.png", "overlap_coefficient", "Raw amplification search: overlap coefficient")
+    plot_threshold_grid(cn_results, outdir / "jaccard_cn_like.png", "jaccard", "CN-like amplification search: Jaccard")
+    plot_threshold_grid(cn_results, outdir / "overlap_cn_like.png", "overlap_coefficient", "CN-like amplification search: overlap coefficient")
 
-    print(f"WES/WGS overlap metrics written to {outpath}")
-    print(f"Shared high bins written to {outdir / 'shared_high_bins.tsv'}")
-    print(
-        "Jaccard = {jaccard:.4f}, overlap coefficient = {overlap:.4f}, "
-        "WES high bins = {wes}, WGS high bins = {wgs}, shared = {shared}".format(
-            jaccard=metrics["jaccard"],
-            overlap=metrics["overlap_coefficient"],
-            wes=metrics["n_wes_high_bins"],
-            wgs=metrics["n_wgs_high_bins"],
-            shared=metrics["n_intersection_bins"],
-        )
-    )
+    raw_best_jaccard = best_row(raw_results, "jaccard")
+    raw_best_overlap = best_row(raw_results, "overlap_coefficient")
+    cn_best_jaccard = best_row(cn_results, "jaccard")
+    cn_best_overlap = best_row(cn_results, "overlap_coefficient")
+
+    for name, row in {
+        "raw_best_jaccard": raw_best_jaccard,
+        "raw_best_overlap": raw_best_overlap,
+        "cn_best_jaccard": cn_best_jaccard,
+        "cn_best_overlap": cn_best_overlap,
+    }.items():
+        pd.DataFrame([row]).to_csv(outdir / f"{name}.tsv", sep="\t", index=False)
+
+    print(f"Raw threshold grid saved to {outdir / 'threshold_grid_raw.tsv'}")
+    print(f"CN-like threshold grid saved to {outdir / 'threshold_grid_cn_like.tsv'}")
+    print(f"Best raw Jaccard: {raw_best_jaccard}")
+    print(f"Best raw overlap: {raw_best_overlap}")
+    print(f"Best CN-like Jaccard: {cn_best_jaccard}")
+    print(f"Best CN-like overlap: {cn_best_overlap}")
 
 
 if __name__ == "__main__":
