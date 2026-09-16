@@ -23,7 +23,7 @@ if [ -z "$OUTDIR" ]; then
 fi
 
 source /home/sspandau/miniconda3/etc/profile.d/conda.sh
-conda activate cfamp
+conda activate wes2wgs
 
 ARGS=(
     --wes-input "$WES_INPUT"
