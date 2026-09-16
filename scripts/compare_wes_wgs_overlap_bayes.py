@@ -92,22 +92,12 @@ def run_bayes_search(df, wes_col, wgs_col, metric="jaccard", n_init=12, n_iter=4
         Real(wgs_min, wgs_max, prior="uniform"),
     ]
 
-    rng = np.random.default_rng(seed)
-    initial_points = np.vstack([
-        np.array([
-            rng.uniform(wes_min, wes_max),
-            rng.uniform(wgs_min, wgs_max),
-        ])
-        for _ in range(max(1, n_init))
-    ])
-
     objective = objective_from_values(wes_vals, wgs_vals, metric=metric)
     result = gp_minimize(
         objective,
         dimensions=bounds,
         n_calls=n_init + n_iter,
-        x0=initial_points,
-        n_random_starts=min(n_init, 10),
+        n_random_starts=max(1, min(n_init, 10)),
         random_state=seed,
         acq_func="EI",
     )
