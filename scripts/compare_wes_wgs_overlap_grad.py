@@ -57,15 +57,22 @@ def soft_metric(wes_vals, wgs_vals, wes_thresh, wgs_thresh, metric="jaccard", te
     return jaccard if metric == "jaccard" else overlap_score
 
 
-def objective_for_metric(wes_vals, wgs_vals, metric="jaccard", temp=0.05):
+def objective_for_metric(wes_vals, wgs_vals, metric="jaccard", temp=0.05, cn_floor=8.0, empty_penalty=1.0):
     def objective(params):
         wes_thresh, wgs_thresh = params
-        return -soft_metric(wes_vals, wgs_vals, wes_thresh, wgs_thresh, metric=metric, temp=temp)
+        score = soft_metric(wes_vals, wgs_vals, wes_thresh, wgs_thresh, metric=metric, temp=temp)
+        real_amp = ((wes_vals > cn_floor).any() or (wgs_vals > cn_floor).any())
+        if real_amp:
+            if (wes_vals > wes_thresh).sum() == 0 and (wgs_vals > wgs_thresh).sum() == 0:
+                score -= empty_penalty
+            if wes_thresh >= float(np.nanmax(wes_vals)) or wgs_thresh >= float(np.nanmax(wgs_vals)):
+                score -= empty_penalty
+        return -score
 
     return objective
 
 
-def gradient_descent_search(df, wes_col, wgs_col, metric="jaccard", n_steps=200, lr=0.05, seed=0, temp=0.05):
+def gradient_descent_search(df, wes_col, wgs_col, metric="jaccard", n_steps=200, lr=0.05, seed=0, temp=0.05, cn_floor=8.0, empty_penalty=1.0):
     wes_vals = pd.to_numeric(df[wes_col], errors="coerce").dropna().to_numpy(dtype=float)
     wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").dropna().to_numpy(dtype=float)
     if len(wes_vals) == 0 or len(wgs_vals) == 0:
@@ -81,7 +88,7 @@ def gradient_descent_search(df, wes_col, wgs_col, metric="jaccard", n_steps=200,
     wgs_min = float(np.min(np.concatenate([wes_vals, wgs_vals])) * 0.5)
     wgs_max = float(np.max(np.concatenate([wes_vals, wgs_vals])) * 1.5)
 
-    obj = objective_for_metric(wes_vals, wgs_vals, metric=metric, temp=temp)
+    obj = objective_for_metric(wes_vals, wgs_vals, metric=metric, temp=temp, cn_floor=cn_floor, empty_penalty=empty_penalty)
     history = []
     for _ in range(n_steps):
         grad = np.zeros(2, dtype=float)
@@ -146,6 +153,8 @@ def main():
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--temp", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cn-floor", type=float, default=8.0, help="Absolute amplification floor (CN-like units) used to penalize empty-set extremes when true amplification is present")
+    parser.add_argument("--empty-penalty", type=float, default=1.0, help="Penalty applied when an empty high-bin set is observed despite real amplification beyond --cn-floor")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -161,9 +170,9 @@ def main():
         masked_count = int(aligned["masked"].sum())
         print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
-    raw_best, raw_hist = gradient_descent_search(aligned, "wes_value", "wgs_value", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed, temp=args.temp)
+    raw_best, raw_hist = gradient_descent_search(aligned, "wes_value", "wgs_value", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed, temp=args.temp, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
     cn_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
-    cn_best, cn_hist = gradient_descent_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed + 1, temp=args.temp)
+    cn_best, cn_hist = gradient_descent_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed + 1, temp=args.temp, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

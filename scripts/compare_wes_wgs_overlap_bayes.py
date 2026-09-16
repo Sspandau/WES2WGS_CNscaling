@@ -34,7 +34,7 @@ from compare_wes_wgs_overlap import (
 )
 
 
-def objective_from_values(wes_vals, wgs_vals, metric="jaccard"):
+def objective_from_values(wes_vals, wgs_vals, metric="jaccard", cn_floor=8.0, empty_penalty=1.0):
     def objective(x):
         wes_thresh = float(x[0])
         wgs_thresh = float(x[1])
@@ -61,12 +61,20 @@ def objective_from_values(wes_vals, wgs_vals, metric="jaccard"):
             overlap = n_inter / min(n_wes, n_wgs)
 
         score = jaccard if metric == "jaccard" else overlap
+
+        real_amp = ((wes_vals > cn_floor).any() or (wgs_vals > cn_floor).any())
+        if real_amp:
+            max_wes = float(np.nanmax(wes_vals)) if np.isfinite(np.nanmax(wes_vals)) else -np.inf
+            max_wgs = float(np.nanmax(wgs_vals)) if np.isfinite(np.nanmax(wgs_vals)) else -np.inf
+            if (n_wes == 0 and n_wgs == 0) or (wes_thresh >= max_wes) or (wgs_thresh >= max_wgs):
+                score -= empty_penalty
+
         return -float(score)
 
     return objective
 
 
-def run_bayes_search(df, wes_col, wgs_col, metric="jaccard", n_init=12, n_iter=40, seed=0):
+def run_bayes_search(df, wes_col, wgs_col, metric="jaccard", n_init=12, n_iter=40, seed=0, cn_floor=8.0, empty_penalty=1.0):
     wes_vals = pd.to_numeric(df[wes_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
     wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
 
@@ -92,7 +100,7 @@ def run_bayes_search(df, wes_col, wgs_col, metric="jaccard", n_init=12, n_iter=4
         Real(wgs_min, wgs_max, prior="uniform"),
     ]
 
-    objective = objective_from_values(wes_vals, wgs_vals, metric=metric)
+    objective = objective_from_values(wes_vals, wgs_vals, metric=metric, cn_floor=cn_floor, empty_penalty=empty_penalty)
     result = gp_minimize(
         objective,
         dimensions=bounds,
@@ -180,6 +188,8 @@ def main():
     parser.add_argument("--n-init", type=int, default=12)
     parser.add_argument("--n-iter", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cn-floor", type=float, default=8.0, help="Absolute amplification floor (CN-like units) used to penalize empty-set extremes when true amplification is present")
+    parser.add_argument("--empty-penalty", type=float, default=1.0, help="Penalty applied when an empty high-bin set is observed despite real amplification beyond --cn-floor")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -196,10 +206,10 @@ def main():
         print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
     raw = aligned.copy()
-    raw_best, raw_hist = run_bayes_search(raw, "wes_value", "wgs_value", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed)
+    raw_best, raw_hist = run_bayes_search(raw, "wes_value", "wgs_value", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
 
     cn_df = make_cn_like_version(raw, "wes_value", "wgs_value")
-    cn_best, cn_hist = run_bayes_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed + 1)
+    cn_best, cn_hist = run_bayes_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed + 1, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

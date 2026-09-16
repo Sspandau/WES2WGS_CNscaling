@@ -164,7 +164,7 @@ def threshold_grid(values, n_points=60):
     return grid.astype(float)
 
 
-def compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
+def compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh, cn_floor=8.0, empty_penalty=1.0):
     wes_high = set(np.where(wes_vals > wes_thresh)[0].tolist())
     wgs_high = set(np.where(wgs_vals > wgs_thresh)[0].tolist())
     shared = wes_high & wgs_high
@@ -187,11 +187,31 @@ def compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
     else:
         overlap = n_inter / min(n_wes, n_wgs)
 
+    wes_real = np.asarray(pd.to_numeric(wes_vals, errors="coerce").dropna())
+    wgs_real = np.asarray(pd.to_numeric(wgs_vals, errors="coerce").dropna())
+    has_real_amp = bool((wes_real > cn_floor).any() or (wgs_real > cn_floor).any())
+    if has_real_amp:
+        if n_wes == 0 and n_wgs == 0:
+            penalty = empty_penalty
+        else:
+            max_wes = float(np.nanmax(wes_real)) if wes_real.size else -np.inf
+            max_wgs = float(np.nanmax(wgs_real)) if wgs_real.size else -np.inf
+            penalty = 0.0
+            if wes_thresh >= max_wes or wgs_thresh >= max_wgs:
+                penalty = empty_penalty
+    else:
+        penalty = 0.0
+
+    jaccard_penalized = float(jaccard - penalty)
+    overlap_penalized = float(overlap - penalty)
+
     return {
         "wes_threshold": float(wes_thresh),
         "wgs_threshold": float(wgs_thresh),
         "jaccard": float(jaccard),
         "overlap_coefficient": float(overlap),
+        "jaccard_penalized": jaccard_penalized,
+        "overlap_coefficient_penalized": overlap_penalized,
         "n_wes_high_bins": int(n_wes),
         "n_wgs_high_bins": int(n_wgs),
         "n_intersection_bins": int(n_inter),
@@ -199,7 +219,7 @@ def compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
     }
 
 
-def search_threshold_grid(df, wes_col, wgs_col, n_points=60):
+def search_threshold_grid(df, wes_col, wgs_col, n_points=60, cn_floor=8.0, empty_penalty=1.0):
     wes_vals = pd.to_numeric(df[wes_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
     wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
 
@@ -209,7 +229,7 @@ def search_threshold_grid(df, wes_col, wgs_col, n_points=60):
     rows = []
     for wes_thresh in wes_thresholds:
         for wgs_thresh in wgs_thresholds:
-            rows.append(compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh))
+            rows.append(compute_overlap_for_thresholds(wes_vals, wgs_vals, wes_thresh, wgs_thresh, cn_floor=cn_floor, empty_penalty=empty_penalty))
 
     out = pd.DataFrame(rows)
     return out.sort_values(["wes_threshold", "wgs_threshold"]).reset_index(drop=True)
@@ -218,12 +238,22 @@ def search_threshold_grid(df, wes_col, wgs_col, n_points=60):
 def best_row(df, metric):
     if df.empty:
         raise ValueError("No threshold grid results found.")
-    i = df[metric].idxmax()
+    score_col = metric
+    if score_col == "jaccard" and "jaccard_penalized" in df.columns:
+        score_col = "jaccard_penalized"
+    elif score_col == "overlap_coefficient" and "overlap_coefficient_penalized" in df.columns:
+        score_col = "overlap_coefficient_penalized"
+    i = df[score_col].idxmax()
     return df.loc[i].to_dict()
 
 
 def plot_threshold_grid(df, outpath, metric, title):
-    table = df.pivot(index="wes_threshold", columns="wgs_threshold", values=metric)
+    metric_for_plot = metric
+    if metric == "jaccard" and "jaccard_penalized" in df.columns:
+        metric_for_plot = "jaccard_penalized"
+    elif metric == "overlap_coefficient" and "overlap_coefficient_penalized" in df.columns:
+        metric_for_plot = "overlap_coefficient_penalized"
+    table = df.pivot(index="wes_threshold", columns="wgs_threshold", values=metric_for_plot)
     fig, ax = plt.subplots(figsize=(7, 6))
     image = ax.imshow(table.to_numpy(), origin="lower", aspect="auto", cmap="viridis")
 
@@ -262,6 +292,8 @@ def main():
     parser.add_argument("--start-col", default="start", help="Start coordinate column")
     parser.add_argument("--target-bin-size", type=int, default=25000, help="Final bin size in bp for comparison")
     parser.add_argument("--search-grid", type=int, default=60, help="Number of thresholds to evaluate per track")
+    parser.add_argument("--cn-floor", type=float, default=8.0, help="Absolute amplification floor (CN-like units) used to penalize empty-set extremes when true amplification is present")
+    parser.add_argument("--empty-penalty", type=float, default=1.0, help="Penalty applied when an empty high-bin set is observed despite real amplification beyond --cn-floor")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output", help="Output directory")
     args = parser.parse_args()
@@ -281,9 +313,9 @@ def main():
         masked_count = int(aligned["masked"].sum())
         print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
-    raw_results = search_threshold_grid(aligned, "wes_value", "wgs_value", n_points=args.search_grid)
+    raw_results = search_threshold_grid(aligned, "wes_value", "wgs_value", n_points=args.search_grid, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
     cn_like_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
-    cn_results = search_threshold_grid(cn_like_df, "wes_cn_like", "wgs_cn_like", n_points=args.search_grid)
+    cn_results = search_threshold_grid(cn_like_df, "wes_cn_like", "wgs_cn_like", n_points=args.search_grid, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
