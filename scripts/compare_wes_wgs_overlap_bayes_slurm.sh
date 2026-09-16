@@ -19,7 +19,7 @@ if [ -z "$WES_INPUT" ] || [ -z "$WGS_INPUT" ]; then
 fi
 
 if [ -z "$OUTDIR" ]; then
-    OUTDIR="$(dirname "$WES_INPUT")/wes_wgs_overlap_output"
+    OUTDIR="$(dirname "$WES_INPUT")/wes_wgs_overlap_bayes_output"
 fi
 
 source /home/sspandau/miniconda3/etc/profile.d/conda.sh
@@ -31,7 +31,7 @@ ARGS=(
     --wgs-input "$WGS_INPUT"
     --wgs-column "$WGS_COLUMN"
     --target-bin-size 25000
-    --search-grid 60
+    --metric jaccard
     --outdir "$OUTDIR"
 )
 
@@ -39,4 +39,4 @@ if [ -n "$MASK_REGIONS" ] && [ -f "$MASK_REGIONS" ]; then
     ARGS+=(--mask-regions "$MASK_REGIONS")
 fi
 
-python3 /home/sspandau/WES2WGS_CNscaling/scripts/compare_wes_wgs_overlap.py "${ARGS[@]}"
+python3 /home/sspandau/WES2WGS_CNscaling/scripts/compare_wes_wgs_overlap_bayes.py "${ARGS[@]}"
