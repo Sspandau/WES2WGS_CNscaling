@@ -28,6 +28,46 @@ def load_data(path):
     return pd.read_csv(path, sep=sep, engine="python")
 
 
+def load_mask_regions(path):
+    mask_df = load_data(path)
+    cols = {str(c).lower(): c for c in mask_df.columns}
+    if "chrom" in cols and "start" in cols and "end" in cols:
+        mask_df = mask_df.rename(columns={cols["chrom"]: "chrom", cols["start"]: "start", cols["end"]: "end"})
+    elif len(mask_df.columns) >= 3:
+        first_three = list(mask_df.columns[:3])
+        mask_df = mask_df.rename(columns={first_three[0]: "chrom", first_three[1]: "start", first_three[2]: "end"})
+    else:
+        raise ValueError("Mask regions file must have at least columns: chrom, start, end")
+
+    mask_df = mask_df[["chrom", "start", "end"]].copy()
+    mask_df["chrom"] = mask_df["chrom"].astype(str)
+    mask_df["start"] = pd.to_numeric(mask_df["start"], errors="coerce").astype(float)
+    mask_df["end"] = pd.to_numeric(mask_df["end"], errors="coerce").astype(float)
+    mask_df = mask_df.dropna(subset=["chrom", "start", "end"]).copy()
+    return mask_df
+
+
+def apply_mask_regions_to_df(df, mask_df):
+    if mask_df is None or mask_df.empty:
+        return df
+
+    out = df.copy()
+    out["masked"] = False
+    for _, row in mask_df.iterrows():
+        chrom = str(row["chrom"])
+        start = int(float(row["start"]))
+        end = int(float(row["end"]))
+        sel = (out["chrom"] == chrom) & (out["start"] >= start) & (out["start"] < end)
+        if sel.any():
+            out.loc[sel, "masked"] = True
+
+    for col in ["wes_value", "wgs_value", "wes_cn_like", "wgs_cn_like"]:
+        if col in out.columns:
+            out.loc[out["masked"], col] = np.nan
+
+    return out
+
+
 def split_bin_column(df, bin_col):
     parsed = df[bin_col].astype(str).str.extract(
         r"^\s*(?P<chrom>chr[\w]+|[0-9XYMxym]+)\s*[:_\-]\s*(?P<start>\d+)\s*[:_\-]\s*(?P<end>\d+)?\s*$"
@@ -222,6 +262,7 @@ def main():
     parser.add_argument("--start-col", default="start", help="Start coordinate column")
     parser.add_argument("--target-bin-size", type=int, default=25000, help="Final bin size in bp for comparison")
     parser.add_argument("--search-grid", type=int, default=60, help="Number of thresholds to evaluate per track")
+    parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output", help="Output directory")
     args = parser.parse_args()
 
@@ -234,6 +275,11 @@ def main():
     wgs_df = rebin_track(wgs_df, wgs_col, target_bin_size=args.target_bin_size)
 
     aligned = align_tracks(wes_df, wgs_df, args.wes_column, wgs_col)
+    if args.mask_regions is not None:
+        mask_df = load_mask_regions(args.mask_regions)
+        aligned = apply_mask_regions_to_df(aligned, mask_df)
+        masked_count = int(aligned["masked"].sum())
+        print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
     raw_results = search_threshold_grid(aligned, "wes_value", "wgs_value", n_points=args.search_grid)
     cn_like_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
