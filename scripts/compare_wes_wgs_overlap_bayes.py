@@ -60,6 +60,42 @@ def compute_stats(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
     )
 
 
+def raw_floor_from_cn(raw_vals, cn_vals, cn_min):
+    """Raw-scale value equivalent to `cn_min` on the CN-like scale.
+
+    Takes the smallest raw value among bins whose CN-like value is >= cn_min. This
+    assumes the CN-like conversion is monotone increasing in the raw value (true for a
+    per-track linear rescale). Returns +inf if no bin reaches cn_min.
+    """
+    raw = pd.to_numeric(pd.Series(np.asarray(raw_vals)), errors="coerce").to_numpy(dtype=float)
+    cn = pd.to_numeric(pd.Series(np.asarray(cn_vals)), errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(raw) & np.isfinite(cn) & (cn >= cn_min)
+    return float(raw[ok].min()) if ok.any() else float("inf")
+
+
+def amplification_status(stats):
+    e_wes = stats["n_wes_high_bins"] == 0
+    e_wgs = stats["n_wgs_high_bins"] == 0
+    if e_wes and e_wgs:
+        return "no_amplification_both"
+    if e_wes:
+        return "no_amplification_wes"
+    if e_wgs:
+        return "no_amplification_wgs"
+    return "ok"
+
+
+def finalize_best(best, wes_vals, wgs_vals, wes_finite, wgs_finite, min_wes_thresh, min_wgs_thresh):
+    """Add status and floor diagnostics; Jaccard is NaN (not 0) when nothing is amplified."""
+    best["status"] = amplification_status(best)
+    best["n_wes_bins_above_floor"] = int((wes_vals > min_wes_thresh).sum()) if min_wes_thresh is not None else int(wes_finite.size)
+    best["n_wgs_bins_above_floor"] = int((wgs_vals > min_wgs_thresh).sum()) if min_wgs_thresh is not None else int(wgs_finite.size)
+    if best["status"] == "no_amplification_both":
+        best["jaccard"] = float("nan")
+        best["overlap_coefficient"] = float("nan")
+    return best
+
+
 def thresholds_from_fracs(wes_finite, wgs_finite, f_wes, f_wgs, min_wes_thresh, min_wgs_thresh):
     """Threshold = value such that the top `frac` of bins are called amplified."""
     t_wes = np.quantile(wes_finite, 1.0 - f_wes)
@@ -102,6 +138,13 @@ def run_bayes_search(
     if lo >= max_frac:
         raise ValueError("min_frac/min_bins is >= max_frac; widen the allowed range")
 
+    # If the floor leaves fewer than min_bins eligible bins, relax the minimum for that track
+    # so the count penalty is not a permanent constant.
+    n_avail_wes = int((wes_vals > min_wes_thresh).sum()) if min_wes_thresh is not None else int(wes_finite.size)
+    n_avail_wgs = int((wgs_vals > min_wgs_thresh).sum()) if min_wgs_thresh is not None else int(wgs_finite.size)
+    min_bins_wes = min(min_bins, n_avail_wes)
+    min_bins_wgs = min(min_bins, n_avail_wgs)
+
     def to_thresholds(x):
         return thresholds_from_fracs(
             wes_finite, wgs_finite, float(x[0]), float(x[1]), min_wes_thresh, min_wgs_thresh
@@ -112,9 +155,9 @@ def run_bayes_search(
         s = compute_stats(wes_vals, wgs_vals, t_wes, t_wgs)
         score = s["jaccard"] if metric == "jaccard" else s["overlap_coefficient"]
         # Soft penalty if actual counts fall outside the allowed range (ties, floors).
-        for n in (s["n_wes_high_bins"], s["n_wgs_high_bins"]):
-            if n < min_bins:
-                score -= count_penalty * (min_bins - n) / min_bins
+        for n, mb in ((s["n_wes_high_bins"], min_bins_wes), (s["n_wgs_high_bins"], min_bins_wgs)):
+            if n < mb:
+                score -= count_penalty * (mb - n) / mb
             elif n > max_bins:
                 score -= count_penalty * (n - max_bins) / max_bins
         return -float(score)
@@ -157,10 +200,14 @@ def run_bayes_search(
         metric=metric,
         **compute_stats(wes_vals, wgs_vals, t_wes, t_wgs),
     )
+    best_row = finalize_best(best_row, wes_vals, wgs_vals, wes_finite, wgs_finite, min_wes_thresh, min_wgs_thresh)
     return best_row, history
 
 
 def plot_bayes_history(history, outpath, metric="jaccard"):
+    history = history[np.isfinite(history["wes_threshold"]) & np.isfinite(history["wgs_threshold"])]
+    if history.empty:
+        return
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(history["wes_threshold"], history["wgs_threshold"], ".", alpha=0.5)
     # Best by the penalized objective so the plot marks the reported best point.
@@ -192,8 +239,7 @@ def main():
     parser.add_argument("--min-frac", type=float, default=0.005, help="Min fraction of bins called amplified per track")
     parser.add_argument("--max-frac", type=float, default=0.10, help="Max fraction of bins called amplified per track")
     parser.add_argument("--min-bins", type=int, default=100, help="Min number of amplified bins per track")
-    parser.add_argument("--min-wes-threshold", type=float, default=None, help="Absolute floor on WES threshold")
-    parser.add_argument("--min-wgs-threshold", type=float, default=None, help="Absolute floor on WGS threshold")
+    parser.add_argument("--min-cn-like", type=float, default=4.0, help="Minimum CN-like value for a bin to count as amplified. Applied directly in the CN-like run and converted to an equivalent raw-scale floor for the raw run. 0 effectively disables it.")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -216,18 +262,24 @@ def main():
         min_frac=args.min_frac,
         max_frac=args.max_frac,
         min_bins=args.min_bins,
-        min_wes_thresh=args.min_wes_threshold,
-        min_wgs_thresh=args.min_wgs_threshold,
     )
 
     raw = aligned.copy()
-    raw_best, raw_hist = run_bayes_search(
-        raw, "wes_value", "wgs_value", seed=args.seed, **search_kwargs
-    )
-
     cn_df = make_cn_like_version(raw, "wes_value", "wgs_value")
+    cn_min = args.min_cn_like
+    if len(cn_df) != len(raw):
+        raise SystemExit("make_cn_like_version changed the number of rows; cannot translate the CN-like floor to the raw scale")
+    raw_floor_wes = raw_floor_from_cn(raw["wes_value"], cn_df["wes_cn_like"], cn_min)
+    raw_floor_wgs = raw_floor_from_cn(raw["wgs_value"], cn_df["wgs_cn_like"], cn_min)
+    print(f"Amplification floor: CN-like > {cn_min} (raw-scale equivalents: WES > {raw_floor_wes:.4g}, WGS > {raw_floor_wgs:.4g})")
+
+    raw_best, raw_hist = run_bayes_search(
+        raw, "wes_value", "wgs_value", seed=args.seed,
+        min_wes_thresh=raw_floor_wes, min_wgs_thresh=raw_floor_wgs, **search_kwargs
+    )
     cn_best, cn_hist = run_bayes_search(
-        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1, **search_kwargs
+        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1,
+        min_wes_thresh=cn_min, min_wgs_thresh=cn_min, **search_kwargs
     )
 
     outdir = Path(args.outdir)
