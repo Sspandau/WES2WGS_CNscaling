@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Gradient-descent surrogate version of the WES/WGS amplification-threshold search.
 
 This keeps the same 25kb, no-smoothing input pipeline as the grid-search script, but
@@ -66,6 +65,42 @@ def compute_stats(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
         n_intersection_bins=n_inter,
         n_union_bins=n_union,
     )
+
+
+def raw_floor_from_cn(raw_vals, cn_vals, cn_min):
+    """Raw-scale value equivalent to `cn_min` on the CN-like scale.
+
+    Takes the smallest raw value among bins whose CN-like value is >= cn_min. This
+    assumes the CN-like conversion is monotone increasing in the raw value (true for a
+    per-track linear rescale). Returns +inf if no bin reaches cn_min.
+    """
+    raw = pd.to_numeric(pd.Series(np.asarray(raw_vals)), errors="coerce").to_numpy(dtype=float)
+    cn = pd.to_numeric(pd.Series(np.asarray(cn_vals)), errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(raw) & np.isfinite(cn) & (cn >= cn_min)
+    return float(raw[ok].min()) if ok.any() else float("inf")
+
+
+def amplification_status(stats):
+    e_wes = stats["n_wes_high_bins"] == 0
+    e_wgs = stats["n_wgs_high_bins"] == 0
+    if e_wes and e_wgs:
+        return "no_amplification_both"
+    if e_wes:
+        return "no_amplification_wes"
+    if e_wgs:
+        return "no_amplification_wgs"
+    return "ok"
+
+
+def finalize_best(best, wes_vals, wgs_vals, wes_finite, wgs_finite, min_wes_thresh, min_wgs_thresh):
+    """Add status and floor diagnostics; Jaccard is NaN (not 0) when nothing is amplified."""
+    best["status"] = amplification_status(best)
+    best["n_wes_bins_above_floor"] = int((wes_vals > min_wes_thresh).sum()) if min_wes_thresh is not None else int(wes_finite.size)
+    best["n_wgs_bins_above_floor"] = int((wgs_vals > min_wgs_thresh).sum()) if min_wgs_thresh is not None else int(wgs_finite.size)
+    if best["status"] == "no_amplification_both":
+        best["jaccard"] = float("nan")
+        best["overlap_coefficient"] = float("nan")
+    return best
 
 
 def thresholds_from_fracs(wes_finite, wgs_finite, f_wes, f_wgs, min_wes_thresh, min_wgs_thresh):
@@ -146,6 +181,13 @@ def gradient_descent_search(
     wes_temp = track_temp(wes_finite)
     wgs_temp = track_temp(wgs_finite)
 
+    # If the floor leaves fewer than min_bins eligible bins, relax the minimum for that track
+    # so the count penalty is not a permanent constant.
+    n_avail_wes = int((wes_vals > min_wes_thresh).sum()) if min_wes_thresh is not None else int(wes_finite.size)
+    n_avail_wgs = int((wgs_vals > min_wgs_thresh).sum()) if min_wgs_thresh is not None else int(wgs_finite.size)
+    min_bins_wes = min(min_bins, n_avail_wes)
+    min_bins_wgs = min(min_bins, n_avail_wgs)
+
     def z_to_frac(z):
         return float(np.exp(log_lo + (log_hi - log_lo) * expit(z)))
 
@@ -158,14 +200,14 @@ def gradient_descent_search(
         t_wes, t_wgs = to_thresholds(z)
         jac, ovl, wes_sum, wgs_sum = soft_stats(wes_vals, wgs_vals, t_wes, t_wgs, wes_temp, wgs_temp)
         score = jac if metric == "jaccard" else ovl
-        score -= count_penalty_term(wes_sum, min_bins, max_bins, count_penalty)
-        score -= count_penalty_term(wgs_sum, min_bins, max_bins, count_penalty)
+        score -= count_penalty_term(wes_sum, min_bins_wes, max_bins, count_penalty)
+        score -= count_penalty_term(wgs_sum, min_bins_wgs, max_bins, count_penalty)
         return -score
 
     def hard_score(stats):
         score = stats["jaccard"] if metric == "jaccard" else stats["overlap_coefficient"]
-        for n in (stats["n_wes_high_bins"], stats["n_wgs_high_bins"]):
-            score -= count_penalty_term(n, min_bins, max_bins, count_penalty)
+        score -= count_penalty_term(stats["n_wes_high_bins"], min_bins_wes, max_bins, count_penalty)
+        score -= count_penalty_term(stats["n_wgs_high_bins"], min_bins_wgs, max_bins, count_penalty)
         return score
 
     rng = np.random.default_rng(seed)
@@ -229,10 +271,14 @@ def gradient_descent_search(
         "n_union_bins": int(best["n_union_bins"]),
         "start": int(best["start"]),
     }
+    best_dict = finalize_best(best_dict, wes_vals, wgs_vals, wes_finite, wgs_finite, min_wes_thresh, min_wgs_thresh)
     return best_dict, hist
 
 
 def plot_trajectory(hist, outpath, metric="jaccard"):
+    hist = hist[np.isfinite(hist["wes_threshold"]) & np.isfinite(hist["wgs_threshold"])]
+    if hist.empty:
+        return
     fig, ax = plt.subplots(figsize=(7, 6))
     for start_idx, sub in hist.groupby("start"):
         ax.plot(sub["wes_threshold"], sub["wgs_threshold"], "-o", ms=2, alpha=0.6, label=f"start {start_idx}")
@@ -266,8 +312,7 @@ def main():
     parser.add_argument("--min-frac", type=float, default=0.005, help="Min fraction of bins called amplified per track")
     parser.add_argument("--max-frac", type=float, default=0.10, help="Max fraction of bins called amplified per track")
     parser.add_argument("--min-bins", type=int, default=100, help="Min number of amplified bins per track")
-    parser.add_argument("--min-wes-threshold", type=float, default=None, help="Absolute floor on WES threshold")
-    parser.add_argument("--min-wgs-threshold", type=float, default=None, help="Absolute floor on WGS threshold")
+    parser.add_argument("--min-cn-like", type=float, default=4.0, help="Minimum CN-like value for a bin to count as amplified. Applied directly in the CN-like run and converted to an equivalent raw-scale floor for the raw run. 0 effectively disables it.")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -292,16 +337,23 @@ def main():
         min_frac=args.min_frac,
         max_frac=args.max_frac,
         min_bins=args.min_bins,
-        min_wes_thresh=args.min_wes_threshold,
-        min_wgs_thresh=args.min_wgs_threshold,
     )
 
-    raw_best, raw_hist = gradient_descent_search(
-        aligned, "wes_value", "wgs_value", seed=args.seed, **search_kwargs
-    )
     cn_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
+    cn_min = args.min_cn_like
+    if len(cn_df) != len(aligned):
+        raise SystemExit("make_cn_like_version changed the number of rows; cannot translate the CN-like floor to the raw scale")
+    raw_floor_wes = raw_floor_from_cn(aligned["wes_value"], cn_df["wes_cn_like"], cn_min)
+    raw_floor_wgs = raw_floor_from_cn(aligned["wgs_value"], cn_df["wgs_cn_like"], cn_min)
+    print(f"Amplification floor: CN-like > {cn_min} (raw-scale equivalents: WES > {raw_floor_wes:.4g}, WGS > {raw_floor_wgs:.4g})")
+
+    raw_best, raw_hist = gradient_descent_search(
+        aligned, "wes_value", "wgs_value", seed=args.seed,
+        min_wes_thresh=raw_floor_wes, min_wgs_thresh=raw_floor_wgs, **search_kwargs
+    )
     cn_best, cn_hist = gradient_descent_search(
-        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1, **search_kwargs
+        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1,
+        min_wes_thresh=cn_min, min_wgs_thresh=cn_min, **search_kwargs
     )
 
     outdir = Path(args.outdir)
