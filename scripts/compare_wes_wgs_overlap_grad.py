@@ -4,6 +4,19 @@
 This keeps the same 25kb, no-smoothing input pipeline as the grid-search script, but
 optimizes thresholds using a smooth surrogate objective rather than a hard thresholded
 set-based objective.
+
+To avoid degenerate solutions (threshold ~0 calling every bin amplified, or a threshold
+above the data maximum calling none), the optimizer works on the FRACTION of bins called
+amplified in each track, restricted to [min_frac, max_frac]. Thresholds are derived from
+quantiles of the data, so both extremes are impossible by construction.
+
+Parameterization:
+    z (unconstrained)  ->  log f = log(lo) + (log(hi) - log(lo)) * sigmoid(z)
+    f                  ->  threshold = quantile(values, 1 - f)
+
+The bounds on f are therefore enforced smoothly, with no clipping. Because the
+objective is non-convex, several starting fractions are tried and the best result
+(judged by the hard, non-smoothed Jaccard/overlap) is reported.
 """
 
 import argparse
@@ -26,120 +39,216 @@ from compare_wes_wgs_overlap import (
 )
 
 
-def sigmoid(x, temp):
-    return 1.0 / (1.0 + np.exp(-(x / temp)))
+def expit(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))
 
 
-def soft_metric(wes_vals, wgs_vals, wes_thresh, wgs_thresh, metric="jaccard", temp=0.05):
-    s_wes = sigmoid(wes_vals - wes_thresh, temp)
-    s_wgs = sigmoid(wgs_vals - wgs_thresh, temp)
+def logit(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1.0 - p))
 
-    overlap = np.minimum(s_wes, s_wgs)
-    union = np.maximum(s_wes, s_wgs)
 
-    inter = float(overlap.sum())
-    union_sum = float(union.sum())
+def compute_stats(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
+    """Unpenalized hard (set-based) overlap statistics for a pair of thresholds."""
+    wes_high = wes_vals > wes_thresh
+    wgs_high = wgs_vals > wgs_thresh
+    n_wes = int(wes_high.sum())
+    n_wgs = int(wgs_high.sum())
+    n_inter = int((wes_high & wgs_high).sum())
+    n_union = int((wes_high | wgs_high).sum())
+    jaccard = n_inter / n_union if n_union else 0.0
+    overlap = n_inter / min(n_wes, n_wgs) if min(n_wes, n_wgs) else 0.0
+    return dict(
+        jaccard=jaccard,
+        overlap_coefficient=overlap,
+        n_wes_high_bins=n_wes,
+        n_wgs_high_bins=n_wgs,
+        n_intersection_bins=n_inter,
+        n_union_bins=n_union,
+    )
+
+
+def thresholds_from_fracs(wes_finite, wgs_finite, f_wes, f_wgs, min_wes_thresh, min_wgs_thresh):
+    """Threshold = value such that the top `frac` of bins are called amplified."""
+    t_wes = np.quantile(wes_finite, 1.0 - f_wes)
+    t_wgs = np.quantile(wgs_finite, 1.0 - f_wgs)
+    if min_wes_thresh is not None:
+        t_wes = max(t_wes, min_wes_thresh)
+    if min_wgs_thresh is not None:
+        t_wgs = max(t_wgs, min_wgs_thresh)
+    return float(t_wes), float(t_wgs)
+
+
+def soft_stats(wes_vals, wgs_vals, wes_thresh, wgs_thresh, wes_temp, wgs_temp):
+    """Smooth surrogate: sigmoid membership per bin, fuzzy intersection/union."""
+    s_wes = expit((wes_vals - wes_thresh) / wes_temp)
+    s_wgs = expit((wgs_vals - wgs_thresh) / wgs_temp)
+    inter = float(np.minimum(s_wes, s_wgs).sum())
+    union = float(np.maximum(s_wes, s_wgs).sum())
     wes_sum = float(s_wes.sum())
     wgs_sum = float(s_wgs.sum())
-
-    if union_sum <= 0:
-        jaccard = 1.0 if inter == 0 else 0.0
-    else:
-        jaccard = inter / union_sum
-
-    if wes_sum == 0 and wgs_sum == 0:
-        overlap_score = 1.0
-    elif min(wes_sum, wgs_sum) == 0:
-        overlap_score = 0.0
-    else:
-        overlap_score = inter / min(wes_sum, wgs_sum)
-
-    return jaccard if metric == "jaccard" else overlap_score
+    jaccard = inter / union if union > 0 else 0.0
+    overlap = inter / min(wes_sum, wgs_sum) if min(wes_sum, wgs_sum) > 0 else 0.0
+    return jaccard, overlap, wes_sum, wgs_sum
 
 
-def objective_for_metric(wes_vals, wgs_vals, metric="jaccard", temp=0.05, cn_floor=8.0, empty_penalty=1.0):
-    def objective(params):
-        wes_thresh, wgs_thresh = params
-        score = soft_metric(wes_vals, wgs_vals, wes_thresh, wgs_thresh, metric=metric, temp=temp)
-        real_amp = ((wes_vals > cn_floor).any() or (wgs_vals > cn_floor).any())
-        if real_amp:
-            if (wes_vals > wes_thresh).sum() == 0 and (wgs_vals > wgs_thresh).sum() == 0:
-                score -= empty_penalty
-            if wes_thresh >= float(np.nanmax(wes_vals)) or wgs_thresh >= float(np.nanmax(wgs_vals)):
-                score -= empty_penalty
+def count_penalty_term(n, min_bins, max_bins, count_penalty):
+    if n < min_bins:
+        return count_penalty * (min_bins - n) / min_bins
+    if n > max_bins:
+        return count_penalty * (n - max_bins) / max_bins
+    return 0.0
+
+
+def gradient_descent_search(
+    df,
+    wes_col,
+    wgs_col,
+    metric="jaccard",
+    n_steps=100,
+    lr=0.2,
+    n_starts=5,
+    seed=0,
+    temp=0.25,
+    min_frac=0.005,
+    max_frac=0.10,
+    min_bins=100,
+    min_wes_thresh=None,
+    min_wgs_thresh=None,
+    count_penalty=1.0,
+):
+    wes_vals = pd.to_numeric(df[wes_col], errors="coerce").to_numpy(dtype=float)
+    wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").to_numpy(dtype=float)
+    wes_vals = np.where(np.isfinite(wes_vals), wes_vals, -np.inf)
+    wgs_vals = np.where(np.isfinite(wgs_vals), wgs_vals, -np.inf)
+    wes_finite = wes_vals[np.isfinite(wes_vals)]
+    wgs_finite = wgs_vals[np.isfinite(wgs_vals)]
+    if wes_finite.size == 0 or wgs_finite.size == 0:
+        raise ValueError("No valid WES/WGS values found")
+
+    n_bins = min(wes_finite.size, wgs_finite.size)
+    max_bins = max_frac * n_bins
+    lo = max(min_frac, min_bins / n_bins)
+    if lo >= max_frac:
+        raise ValueError("min_frac/min_bins is >= max_frac; widen the allowed range")
+    log_lo, log_hi = np.log(lo), np.log(max_frac)
+
+    # Sigmoid temperature is set per track, relative to how far apart the thresholds
+    # for the allowed fraction range are, so `temp` is scale-free (raw vs CN-like).
+    def track_temp(finite):
+        span = np.quantile(finite, 1.0 - lo) - np.quantile(finite, 1.0 - max_frac)
+        if not np.isfinite(span) or span <= 0:
+            span = float(np.std(finite))
+        if not np.isfinite(span) or span <= 0:
+            span = 1.0
+        return temp * span
+
+    wes_temp = track_temp(wes_finite)
+    wgs_temp = track_temp(wgs_finite)
+
+    def z_to_frac(z):
+        return float(np.exp(log_lo + (log_hi - log_lo) * expit(z)))
+
+    def to_thresholds(z):
+        return thresholds_from_fracs(
+            wes_finite, wgs_finite, z_to_frac(z[0]), z_to_frac(z[1]), min_wes_thresh, min_wgs_thresh
+        )
+
+    def soft_loss(z):
+        t_wes, t_wgs = to_thresholds(z)
+        jac, ovl, wes_sum, wgs_sum = soft_stats(wes_vals, wgs_vals, t_wes, t_wgs, wes_temp, wgs_temp)
+        score = jac if metric == "jaccard" else ovl
+        score -= count_penalty_term(wes_sum, min_bins, max_bins, count_penalty)
+        score -= count_penalty_term(wgs_sum, min_bins, max_bins, count_penalty)
         return -score
 
-    return objective
-
-
-def gradient_descent_search(df, wes_col, wgs_col, metric="jaccard", n_steps=200, lr=0.05, seed=0, temp=0.05, cn_floor=8.0, empty_penalty=1.0):
-    wes_vals = pd.to_numeric(df[wes_col], errors="coerce").dropna().to_numpy(dtype=float)
-    wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").dropna().to_numpy(dtype=float)
-    if len(wes_vals) == 0 or len(wgs_vals) == 0:
-        raise ValueError("No valid values found for optimization")
+    def hard_score(stats):
+        score = stats["jaccard"] if metric == "jaccard" else stats["overlap_coefficient"]
+        for n in (stats["n_wes_high_bins"], stats["n_wgs_high_bins"]):
+            score -= count_penalty_term(n, min_bins, max_bins, count_penalty)
+        return score
 
     rng = np.random.default_rng(seed)
-    wes_start = float(np.median(wes_vals))
-    wgs_start = float(np.median(wgs_vals))
-    params = np.array([wes_start, wgs_start], dtype=float)
+    start_u = np.linspace(0.1, 0.9, max(1, n_starts))  # positions within log-fraction range
+    beta1, beta2, adam_eps = 0.9, 0.999, 1e-8
+    fd_eps = 1e-3
 
-    wes_min = float(np.min(np.concatenate([wes_vals, wgs_vals])) * 0.5)
-    wes_max = float(np.max(np.concatenate([wes_vals, wgs_vals])) * 1.5)
-    wgs_min = float(np.min(np.concatenate([wes_vals, wgs_vals])) * 0.5)
-    wgs_max = float(np.max(np.concatenate([wes_vals, wgs_vals])) * 1.5)
+    rows = []
+    for start_idx, u0 in enumerate(start_u):
+        z = np.array([logit(u0), logit(u0)], dtype=float) + rng.normal(0, 0.1, size=2)
+        m = np.zeros(2)
+        v = np.zeros(2)
+        for step in range(n_steps + 1):
+            # Record the current point (step 0 = the starting point).
+            t_wes, t_wgs = to_thresholds(z)
+            stats = compute_stats(wes_vals, wgs_vals, t_wes, t_wgs)
+            rows.append(dict(
+                start=start_idx,
+                step=step,
+                wes_frac=z_to_frac(z[0]),
+                wgs_frac=z_to_frac(z[1]),
+                wes_threshold=t_wes,
+                wgs_threshold=t_wgs,
+                soft_objective=-soft_loss(z),
+                hard_score=hard_score(stats),
+                metric=metric,
+                **stats,
+            ))
+            if step == n_steps:
+                break
 
-    obj = objective_for_metric(wes_vals, wgs_vals, metric=metric, temp=temp, cn_floor=cn_floor, empty_penalty=empty_penalty)
-    history = []
-    for _ in range(n_steps):
-        grad = np.zeros(2, dtype=float)
-        for i in range(2):
-            eps = 1e-3 * (abs(params[i]) + 1e-6)
-            p_plus = params.copy()
-            p_minus = params.copy()
-            p_plus[i] += eps
-            p_minus[i] -= eps
-            loss_plus = obj(p_plus)
-            loss_minus = obj(p_minus)
-            grad[i] = (loss_plus - loss_minus) / (2 * eps)
-        params -= lr * grad
-        params[0] = np.clip(params[0], wes_min, wes_max)
-        params[1] = np.clip(params[1], wgs_min, wgs_max)
-        score = -obj(params)
-        history.append({
-            "step": len(history),
-            "wes_threshold": float(params[0]),
-            "wgs_threshold": float(params[1]),
-            "metric_value": float(score),
-            "metric": metric,
-        })
+            # Central finite-difference gradient in z-space (2 parameters).
+            grad = np.zeros(2)
+            for i in range(2):
+                zp, zm = z.copy(), z.copy()
+                zp[i] += fd_eps
+                zm[i] -= fd_eps
+                grad[i] = (soft_loss(zp) - soft_loss(zm)) / (2 * fd_eps)
 
-    hist = pd.DataFrame(history)
-    best = hist.loc[hist["metric_value"].idxmax()]
+            # Adam update.
+            t = step + 1
+            m = beta1 * m + (1 - beta1) * grad
+            v = beta2 * v + (1 - beta2) * grad ** 2
+            m_hat = m / (1 - beta1 ** t)
+            v_hat = v / (1 - beta2 ** t)
+            z = z - lr * m_hat / (np.sqrt(v_hat) + adam_eps)
+
+    hist = pd.DataFrame(rows)
+    best = hist.loc[hist["hard_score"].idxmax()]
     best_dict = {
         "wes_threshold": float(best["wes_threshold"]),
         "wgs_threshold": float(best["wgs_threshold"]),
+        "wes_frac": float(best["wes_frac"]),
+        "wgs_frac": float(best["wgs_frac"]),
         "metric": metric,
-        "metric_value": float(best["metric_value"]),
+        "jaccard": float(best["jaccard"]),
+        "overlap_coefficient": float(best["overlap_coefficient"]),
+        "n_wes_high_bins": int(best["n_wes_high_bins"]),
+        "n_wgs_high_bins": int(best["n_wgs_high_bins"]),
+        "n_intersection_bins": int(best["n_intersection_bins"]),
+        "n_union_bins": int(best["n_union_bins"]),
+        "start": int(best["start"]),
     }
     return best_dict, hist
 
 
 def plot_trajectory(hist, outpath, metric="jaccard"):
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(hist["wes_threshold"], hist["wgs_threshold"], "-o", alpha=0.8)
-    best = hist.loc[hist["metric_value"].idxmax()]
-    ax.scatter([best["wes_threshold"]], [best["wgs_threshold"]], color="red", s=40, label="best")
+    for start_idx, sub in hist.groupby("start"):
+        ax.plot(sub["wes_threshold"], sub["wgs_threshold"], "-o", ms=2, alpha=0.6, label=f"start {start_idx}")
+    best = hist.loc[hist["hard_score"].idxmax()]
+    ax.scatter([best["wes_threshold"]], [best["wgs_threshold"]], color="red", s=50, zorder=5, label="best")
     ax.set_xlabel("WES threshold")
     ax.set_ylabel("WGS threshold")
     ax.set_title(f"Gradient-descent search: {metric}")
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(outpath, dpi=200)
     plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--wes-input", required=True)
     parser.add_argument("--wes-column", required=True)
     parser.add_argument("--wgs-input", required=True)
@@ -149,12 +258,16 @@ def main():
     parser.add_argument("--start-col", default="start")
     parser.add_argument("--target-bin-size", type=int, default=25000)
     parser.add_argument("--metric", choices=["jaccard", "overlap"], default="jaccard")
-    parser.add_argument("--n-steps", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=0.05)
-    parser.add_argument("--temp", type=float, default=0.05)
+    parser.add_argument("--n-steps", type=int, default=100, help="Adam steps per starting point")
+    parser.add_argument("--n-starts", type=int, default=5, help="Number of starting fractions (log-spaced across the allowed range)")
+    parser.add_argument("--lr", type=float, default=0.2, help="Adam learning rate in the unconstrained (logit) space")
+    parser.add_argument("--temp", type=float, default=0.25, help="Sigmoid temperature, relative to the threshold spread across the allowed fraction range")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cn-floor", type=float, default=8.0, help="Absolute amplification floor (CN-like units) used to penalize empty-set extremes when true amplification is present")
-    parser.add_argument("--empty-penalty", type=float, default=1.0, help="Penalty applied when an empty high-bin set is observed despite real amplification beyond --cn-floor")
+    parser.add_argument("--min-frac", type=float, default=0.005, help="Min fraction of bins called amplified per track")
+    parser.add_argument("--max-frac", type=float, default=0.10, help="Max fraction of bins called amplified per track")
+    parser.add_argument("--min-bins", type=int, default=100, help="Min number of amplified bins per track")
+    parser.add_argument("--min-wes-threshold", type=float, default=None, help="Absolute floor on WES threshold")
+    parser.add_argument("--min-wgs-threshold", type=float, default=None, help="Absolute floor on WGS threshold")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -170,9 +283,26 @@ def main():
         masked_count = int(aligned["masked"].sum())
         print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
-    raw_best, raw_hist = gradient_descent_search(aligned, "wes_value", "wgs_value", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed, temp=args.temp, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
+    search_kwargs = dict(
+        metric=args.metric,
+        n_steps=args.n_steps,
+        lr=args.lr,
+        n_starts=args.n_starts,
+        temp=args.temp,
+        min_frac=args.min_frac,
+        max_frac=args.max_frac,
+        min_bins=args.min_bins,
+        min_wes_thresh=args.min_wes_threshold,
+        min_wgs_thresh=args.min_wgs_threshold,
+    )
+
+    raw_best, raw_hist = gradient_descent_search(
+        aligned, "wes_value", "wgs_value", seed=args.seed, **search_kwargs
+    )
     cn_df = make_cn_like_version(aligned, "wes_value", "wgs_value")
-    cn_best, cn_hist = gradient_descent_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_steps=args.n_steps, lr=args.lr, seed=args.seed + 1, temp=args.temp, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
+    cn_best, cn_hist = gradient_descent_search(
+        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1, **search_kwargs
+    )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

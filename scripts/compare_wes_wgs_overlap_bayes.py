@@ -2,8 +2,14 @@
 """Bayesian-optimization version of the WES/WGS amplification-threshold search.
 
 This keeps the same 25kb, no-smoothing logic as the grid-search script, but uses a
-black-box Bayesian optimizer to search over the WES and WGS amplification thresholds
-for the best Jaccard or overlap score.
+black-box Bayesian optimizer to search for the WES and WGS amplification thresholds
+that give the best Jaccard or overlap score.
+
+To avoid degenerate solutions (threshold ~0 calling every bin amplified, or a
+threshold above the data maximum calling none), the optimizer searches over the
+FRACTION of bins called amplified in each track. Thresholds are derived from
+quantiles of the data, so both extremes are impossible by construction. A soft
+penalty on the actual bin counts handles ties and absolute threshold floors.
 """
 
 import argparse
@@ -34,136 +40,131 @@ from compare_wes_wgs_overlap import (
 )
 
 
-def objective_from_values(wes_vals, wgs_vals, metric="jaccard", cn_floor=8.0, empty_penalty=1.0):
+def compute_stats(wes_vals, wgs_vals, wes_thresh, wgs_thresh):
+    """Unpenalized overlap statistics for a pair of thresholds."""
+    wes_high = wes_vals > wes_thresh
+    wgs_high = wgs_vals > wgs_thresh
+    n_wes = int(wes_high.sum())
+    n_wgs = int(wgs_high.sum())
+    n_inter = int((wes_high & wgs_high).sum())
+    n_union = int((wes_high | wgs_high).sum())
+    jaccard = n_inter / n_union if n_union else 0.0
+    overlap = n_inter / min(n_wes, n_wgs) if min(n_wes, n_wgs) else 0.0
+    return dict(
+        jaccard=jaccard,
+        overlap_coefficient=overlap,
+        n_wes_high_bins=n_wes,
+        n_wgs_high_bins=n_wgs,
+        n_intersection_bins=n_inter,
+        n_union_bins=n_union,
+    )
+
+
+def thresholds_from_fracs(wes_finite, wgs_finite, f_wes, f_wgs, min_wes_thresh, min_wgs_thresh):
+    """Threshold = value such that the top `frac` of bins are called amplified."""
+    t_wes = np.quantile(wes_finite, 1.0 - f_wes)
+    t_wgs = np.quantile(wgs_finite, 1.0 - f_wgs)
+    if min_wes_thresh is not None:
+        t_wes = max(t_wes, min_wes_thresh)
+    if min_wgs_thresh is not None:
+        t_wgs = max(t_wgs, min_wgs_thresh)
+    return float(t_wes), float(t_wgs)
+
+
+def run_bayes_search(
+    df,
+    wes_col,
+    wgs_col,
+    metric="jaccard",
+    n_init=12,
+    n_iter=40,
+    seed=0,
+    min_frac=0.005,
+    max_frac=0.10,
+    min_bins=100,
+    min_wes_thresh=None,
+    min_wgs_thresh=None,
+    count_penalty=1.0,
+):
+    wes_vals = pd.to_numeric(df[wes_col], errors="coerce").to_numpy(dtype=float)
+    wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").to_numpy(dtype=float)
+    wes_vals = np.where(np.isfinite(wes_vals), wes_vals, -np.inf)
+    wgs_vals = np.where(np.isfinite(wgs_vals), wgs_vals, -np.inf)
+    wes_finite = wes_vals[np.isfinite(wes_vals)]
+    wgs_finite = wgs_vals[np.isfinite(wgs_vals)]
+    if wes_finite.size == 0 or wgs_finite.size == 0:
+        raise ValueError("No valid WES/WGS values found")
+
+    # Use the number of usable (non-masked, finite) bins as the denominator.
+    n_bins = min(wes_finite.size, wgs_finite.size)
+    max_bins = max_frac * n_bins
+    lo = max(min_frac, min_bins / n_bins)
+    if lo >= max_frac:
+        raise ValueError("min_frac/min_bins is >= max_frac; widen the allowed range")
+
+    def to_thresholds(x):
+        return thresholds_from_fracs(
+            wes_finite, wgs_finite, float(x[0]), float(x[1]), min_wes_thresh, min_wgs_thresh
+        )
+
     def objective(x):
-        wes_thresh = float(x[0])
-        wgs_thresh = float(x[1])
-        wes_high = set(np.where(wes_vals > wes_thresh)[0].tolist())
-        wgs_high = set(np.where(wgs_vals > wgs_thresh)[0].tolist())
-        shared = wes_high & wgs_high
-        union = wes_high | wgs_high
-
-        n_inter = len(shared)
-        n_union = len(union)
-        n_wes = len(wes_high)
-        n_wgs = len(wgs_high)
-
-        if n_union == 0:
-            jaccard = 1.0 if n_inter == 0 else 0.0
-        else:
-            jaccard = n_inter / n_union
-
-        if n_wes == 0 and n_wgs == 0:
-            overlap = 1.0
-        elif min(n_wes, n_wgs) == 0:
-            overlap = 0.0
-        else:
-            overlap = n_inter / min(n_wes, n_wgs)
-
-        score = jaccard if metric == "jaccard" else overlap
-
-        real_amp = ((wes_vals > cn_floor).any() or (wgs_vals > cn_floor).any())
-        if real_amp:
-            max_wes = float(np.nanmax(wes_vals)) if np.isfinite(np.nanmax(wes_vals)) else -np.inf
-            max_wgs = float(np.nanmax(wgs_vals)) if np.isfinite(np.nanmax(wgs_vals)) else -np.inf
-            if (n_wes == 0 and n_wgs == 0) or (wes_thresh >= max_wes) or (wgs_thresh >= max_wgs):
-                score -= empty_penalty
-
+        t_wes, t_wgs = to_thresholds(x)
+        s = compute_stats(wes_vals, wgs_vals, t_wes, t_wgs)
+        score = s["jaccard"] if metric == "jaccard" else s["overlap_coefficient"]
+        # Soft penalty if actual counts fall outside the allowed range (ties, floors).
+        for n in (s["n_wes_high_bins"], s["n_wgs_high_bins"]):
+            if n < min_bins:
+                score -= count_penalty * (min_bins - n) / min_bins
+            elif n > max_bins:
+                score -= count_penalty * (n - max_bins) / max_bins
         return -float(score)
 
-    return objective
-
-
-def run_bayes_search(df, wes_col, wgs_col, metric="jaccard", n_init=12, n_iter=40, seed=0, cn_floor=8.0, empty_penalty=1.0):
-    wes_vals = pd.to_numeric(df[wes_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
-    wgs_vals = pd.to_numeric(df[wgs_col], errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
-
-    wes_min = float(np.nanmin(np.asarray(pd.to_numeric(df[wes_col], errors="coerce").dropna())))
-    wes_max = float(np.nanmax(np.asarray(pd.to_numeric(df[wes_col], errors="coerce").dropna())))
-    wgs_min = float(np.nanmin(np.asarray(pd.to_numeric(df[wgs_col], errors="coerce").dropna())))
-    wgs_max = float(np.nanmax(np.asarray(pd.to_numeric(df[wgs_col], errors="coerce").dropna())))
-
-    if not np.isfinite(wes_min) or not np.isfinite(wes_max):
-        raise ValueError(f"No valid WES values found in column '{wes_col}'")
-    if not np.isfinite(wgs_min) or not np.isfinite(wgs_max):
-        raise ValueError(f"No valid WGS values found in column '{wgs_col}'")
-
-    if wes_min == wes_max:
-        wes_min = wes_min - 1.0
-        wes_max = wes_max + 1.0
-    if wgs_min == wgs_max:
-        wgs_min = wgs_min - 1.0
-        wgs_max = wgs_max + 1.0
-
     bounds = [
-        Real(wes_min, wes_max, prior="uniform"),
-        Real(wgs_min, wgs_max, prior="uniform"),
+        Real(lo, max_frac, prior="log-uniform"),
+        Real(lo, max_frac, prior="log-uniform"),
     ]
-
-    objective = objective_from_values(wes_vals, wgs_vals, metric=metric, cn_floor=cn_floor, empty_penalty=empty_penalty)
     result = gp_minimize(
         objective,
         dimensions=bounds,
         n_calls=n_init + n_iter,
-        n_random_starts=max(1, min(n_init, 10)),
+        n_initial_points=max(1, min(n_init, 10)),
         random_state=seed,
         acq_func="EI",
     )
 
-    best = np.asarray(result.x)
-    wes_thresh = float(best[0])
-    wgs_thresh = float(best[1])
-    wes_high = set(np.where(wes_vals > wes_thresh)[0].tolist())
-    wgs_high = set(np.where(wgs_vals > wgs_thresh)[0].tolist())
-    shared = wes_high & wgs_high
-    union = wes_high | wgs_high
-
-    n_inter = len(shared)
-    n_union = len(union)
-    n_wes = len(wes_high)
-    n_wgs = len(wgs_high)
-
-    if n_union == 0:
-        jaccard = 1.0 if n_inter == 0 else 0.0
-    else:
-        jaccard = n_inter / n_union
-
-    if n_wes == 0 and n_wgs == 0:
-        overlap = 1.0
-    elif min(n_wes, n_wgs) == 0:
-        overlap = 0.0
-    else:
-        overlap = n_inter / min(n_wes, n_wgs)
-
-    history = pd.DataFrame(result.x_iters, columns=["wes_threshold", "wgs_threshold"])
+    rows = []
+    for x in result.x_iters:
+        t_wes, t_wgs = to_thresholds(x)
+        rows.append(
+            dict(
+                wes_frac=x[0],
+                wgs_frac=x[1],
+                wes_threshold=t_wes,
+                wgs_threshold=t_wgs,
+                **compute_stats(wes_vals, wgs_vals, t_wes, t_wgs),
+            )
+        )
+    history = pd.DataFrame(rows)
     history["objective"] = np.asarray(result.func_vals)
     history["metric"] = metric
-    history["jaccard"] = [
-        objective_from_values(wes_vals, wgs_vals, metric="jaccard")(row) * -1.0 for row in result.x_iters
-    ]
-    history["overlap_coefficient"] = [
-        objective_from_values(wes_vals, wgs_vals, metric="overlap")(row) * -1.0 for row in result.x_iters
-    ]
 
-    best_row = {
-        "wes_threshold": wes_thresh,
-        "wgs_threshold": wgs_thresh,
-        "metric": metric,
-        "jaccard": float(jaccard),
-        "overlap_coefficient": float(overlap),
-        "n_wes_high_bins": int(n_wes),
-        "n_wgs_high_bins": int(n_wgs),
-        "n_intersection_bins": int(n_inter),
-        "n_union_bins": int(n_union),
-    }
-
+    t_wes, t_wgs = to_thresholds(result.x)
+    best_row = dict(
+        wes_threshold=t_wes,
+        wgs_threshold=t_wgs,
+        wes_frac=float(result.x[0]),
+        wgs_frac=float(result.x[1]),
+        metric=metric,
+        **compute_stats(wes_vals, wgs_vals, t_wes, t_wgs),
+    )
     return best_row, history
 
 
 def plot_bayes_history(history, outpath, metric="jaccard"):
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(history["wes_threshold"], history["wgs_threshold"], ".", alpha=0.5)
-    best = history.loc[history[metric].idxmax()]
+    # Best by the penalized objective so the plot marks the reported best point.
+    best = history.loc[history["objective"].idxmin()]
     ax.scatter([best["wes_threshold"]], [best["wgs_threshold"]], color="red", s=40, label="best")
     ax.set_xlabel("WES threshold")
     ax.set_ylabel("WGS threshold")
@@ -188,8 +189,11 @@ def main():
     parser.add_argument("--n-init", type=int, default=12)
     parser.add_argument("--n-iter", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cn-floor", type=float, default=8.0, help="Absolute amplification floor (CN-like units) used to penalize empty-set extremes when true amplification is present")
-    parser.add_argument("--empty-penalty", type=float, default=1.0, help="Penalty applied when an empty high-bin set is observed despite real amplification beyond --cn-floor")
+    parser.add_argument("--min-frac", type=float, default=0.005, help="Min fraction of bins called amplified per track")
+    parser.add_argument("--max-frac", type=float, default=0.10, help="Max fraction of bins called amplified per track")
+    parser.add_argument("--min-bins", type=int, default=100, help="Min number of amplified bins per track")
+    parser.add_argument("--min-wes-threshold", type=float, default=None, help="Absolute floor on WES threshold")
+    parser.add_argument("--min-wgs-threshold", type=float, default=None, help="Absolute floor on WGS threshold")
     parser.add_argument("--mask-regions", default=None, help="Optional CSV/TSV of regions to mask, with columns chrom,start,end")
     parser.add_argument("--outdir", default="wes_wgs_overlap_output")
     args = parser.parse_args()
@@ -205,11 +209,26 @@ def main():
         masked_count = int(aligned["masked"].sum())
         print(f"Applied mask regions from {args.mask_regions}: masked {masked_count} aligned bins")
 
+    search_kwargs = dict(
+        metric=args.metric,
+        n_init=args.n_init,
+        n_iter=args.n_iter,
+        min_frac=args.min_frac,
+        max_frac=args.max_frac,
+        min_bins=args.min_bins,
+        min_wes_thresh=args.min_wes_threshold,
+        min_wgs_thresh=args.min_wgs_threshold,
+    )
+
     raw = aligned.copy()
-    raw_best, raw_hist = run_bayes_search(raw, "wes_value", "wgs_value", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
+    raw_best, raw_hist = run_bayes_search(
+        raw, "wes_value", "wgs_value", seed=args.seed, **search_kwargs
+    )
 
     cn_df = make_cn_like_version(raw, "wes_value", "wgs_value")
-    cn_best, cn_hist = run_bayes_search(cn_df, "wes_cn_like", "wgs_cn_like", metric=args.metric, n_init=args.n_init, n_iter=args.n_iter, seed=args.seed + 1, cn_floor=args.cn_floor, empty_penalty=args.empty_penalty)
+    cn_best, cn_hist = run_bayes_search(
+        cn_df, "wes_cn_like", "wgs_cn_like", seed=args.seed + 1, **search_kwargs
+    )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
