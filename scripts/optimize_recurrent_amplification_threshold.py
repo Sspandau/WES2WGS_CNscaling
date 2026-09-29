@@ -137,19 +137,19 @@ def _normalize_class_label(s):
     return re.sub(r"[\s_-]+", "", str(s).strip().lower())
 
 
-def load_qualifying_amplicons_by_sample(classification_tsv, categories=("ecDNA", "BFB", "CNC")):
+def load_qualifying_amplicons_by_sample(classification_tsv, categories=("ecDNA", "BFB", "CNC", "FAN")):
     """Reads the ONE consolidated classification TSV and returns
     {sample_name: {qualifying amplicon_number strings}} for amplicons AC
-    called ecDNA+, BFB+, and/or Complex-non-cyclic, restricted to whichever
-    of those three `categories` are requested. Useful for isolating ecDNA
-    alone, since ecDNA tends to sit at much higher/more sharply focal depth
-    than BFB or Complex-non-cyclic amplicons -- pooling all three widens
-    the orange distribution and can visually (and numerically) look less
-    separated from background even with nothing wrong in the pipeline."""
+    called ecDNA+, BFB+, FAN+, and/or Complex-non-cyclic, restricted to
+    whichever of those four `categories` are requested. Useful for isolating
+    ecDNA alone, since ecDNA tends to sit at much higher/more sharply focal
+    depth than BFB, FAN, or Complex-non-cyclic amplicons -- pooling all four
+    widens the orange distribution and can visually (and numerically) look
+    less separated from background even with nothing wrong in the pipeline."""
     categories = {c.strip().lower() for c in categories}
-    unknown = categories - {"ecdna", "bfb", "cnc"}
+    unknown = categories - {"ecdna", "bfb", "fan", "cnc"}
     if unknown:
-        raise ValueError(f"Unknown --orange-categories value(s): {unknown}. Valid: ecDNA, BFB, CNC")
+        raise ValueError(f"Unknown --orange-categories value(s): {unknown}. Valid: ecDNA, BFB, FAN, CNC")
 
     df = pd.read_csv(classification_tsv, sep="\t", engine="python")
 
@@ -163,6 +163,8 @@ def load_qualifying_amplicons_by_sample(classification_tsv, categories=("ecDNA",
         else pd.Series(False, index=df.index)
     is_bfb = (df["BFB+"].astype(str).str.strip() == "Positive") if "BFB+" in df.columns \
         else pd.Series(False, index=df.index)
+    is_fan = (df["FAN+"].astype(str).str.strip() == "Positive") if "FAN+" in df.columns \
+        else pd.Series(False, index=df.index)
     normalized_class = df["amplicon_decomposition_class"].map(_normalize_class_label)
     is_cnc = normalized_class == "complexnoncyclic"
 
@@ -171,6 +173,8 @@ def load_qualifying_amplicons_by_sample(classification_tsv, categories=("ecDNA",
         qualifies |= is_ecdna
     if "bfb" in categories:
         qualifies |= is_bfb
+    if "fan" in categories:
+        qualifies |= is_fan
     if "cnc" in categories:
         qualifies |= is_cnc
 
@@ -186,11 +190,11 @@ def load_qualifying_amplicons_by_sample(classification_tsv, categories=("ecDNA",
 
 def load_samples_with_ecdna_or_bfb(classification_tsv):
     """Reads the classification TSV and returns the set of sample_names that
-    have AT LEAST ONE amplicon called ecDNA+ or BFB+ (independent of
-    --orange-categories -- this always checks the true ecDNA+/BFB+ status,
-    since it's used to decide which samples are trusted to vote on what
-    counts as 'recurrent', not what counts as 'orange'). CNC-only samples
-    (no ecDNA+/BFB+) are NOT included here."""
+    have AT LEAST ONE amplicon called ecDNA+, BFB+, or FAN+ (independent of
+    --orange-categories -- this always checks the true ecDNA+/BFB+/FAN+
+    status, since it's used to decide which samples are trusted to vote on
+    what counts as 'recurrent', not what counts as 'orange'). CNC-only
+    samples (no ecDNA+/BFB+/FAN+) are NOT included here."""
     df = pd.read_csv(classification_tsv, sep="\t", engine="python")
     required = {"sample_name"}
     missing = required - set(df.columns)
@@ -201,8 +205,10 @@ def load_samples_with_ecdna_or_bfb(classification_tsv):
         else pd.Series(False, index=df.index)
     is_bfb = (df["BFB+"].astype(str).str.strip() == "Positive") if "BFB+" in df.columns \
         else pd.Series(False, index=df.index)
+    is_fan = (df["FAN+"].astype(str).str.strip() == "Positive") if "FAN+" in df.columns \
+        else pd.Series(False, index=df.index)
 
-    flagged = df.loc[is_ecdna | is_bfb, "sample_name"].astype(str).str.strip()
+    flagged = df.loc[is_ecdna | is_bfb | is_fan, "sample_name"].astype(str).str.strip()
     return set(flagged)
 
 
@@ -734,14 +740,14 @@ def main():
     p.add_argument("--classification-bed-dir", required=True,
                     help="Path to the consolidated <prefix>_classification_bed_files/ directory "
                          "(one directory shared across all samples)")
-    p.add_argument("--orange-categories", default="ecDNA,BFB,CNC",
-                    help="Comma list of which AC categories count as 'orange': any of ecDNA, BFB, CNC. "
-                         "Default includes all three. Restrict to e.g. 'ecDNA' to isolate ecDNA-only "
-                         "amplicons, which tend to sit at higher/more sharply focal depth than BFB or "
-                         "Complex-non-cyclic amplicons -- pooling all three widens the orange "
+    p.add_argument("--orange-categories", default="ecDNA,BFB,CNC,FAN",
+                    help="Comma list of which AC categories count as 'orange': any of ecDNA, BFB, CNC, FAN. "
+                         "Default includes all four. Restrict to e.g. 'ecDNA' to isolate ecDNA-only "
+                         "amplicons, which tend to sit at higher/more sharply focal depth than BFB, FAN, "
+                         "or Complex-non-cyclic amplicons -- pooling all four widens the orange "
                          "distribution and can look/measure less separated from background.")
     p.add_argument("--include-ecdna-bfb-samples-in-recurrent-calling", action="store_true",
-                    help="By default, samples with >=1 ecDNA+ or BFB+ amplicon are excluded from voting "
+                    help="By default, samples with >=1 ecDNA+, BFB+, or FAN+ amplicon are excluded from voting "
                          "on what counts as 'recurrent' (their complex amplicon architecture can produce "
                          "broadly elevated/unstable depth beyond just their classified region, biasing "
                          "the recurrence caller). Orange bins and min_samples_ratio's denominator are "
