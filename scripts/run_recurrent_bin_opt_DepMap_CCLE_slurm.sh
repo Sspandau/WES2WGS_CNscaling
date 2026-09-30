@@ -48,7 +48,7 @@ CLASSIFICATION_BED_DIRS=(
 # header optional). Only needed if some WES names can't be matched by name.
 ID_MAP_IN=""
 
-OUTDIR="/data/analysis/bayesian_threshold_search"
+OUTDIR="/metropolis/projects/sspandau/depmap/recurrent_bins_search"
 INPUT_DIR="${OUTDIR}/inputs"          # merged/renamed inputs live here
 MERGED_AA="${INPUT_DIR}/aa_merged"
 MERGED_BED="${INPUT_DIR}/classification_bed_merged"
@@ -74,8 +74,8 @@ echo "== Project dir: ${PROJECT_DIR}"
 
 BASE_SCRIPT="${SCRIPTS_DIR}/find_recurrent_novel_amplifications_binlevel.py"
 GRID_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold.py"
-BAYES_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold_bayes.py"
-for f in "${BAYES_SCRIPT}" "${BASE_SCRIPT}" "${GRID_SCRIPT}"; do
+OPT_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold_bayes.py"
+for f in "${OPT_SCRIPT}" "${BASE_SCRIPT}" "${GRID_SCRIPT}"; do
     [[ -f "$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
 
@@ -318,7 +318,7 @@ EOF
 # STEP 3: run the search
 # ==========================================================================
 echo "== Starting Bayesian search at $(date)"
-python3 "${BAYES_SCRIPT}" \
+python3 "${OPT_SCRIPT}" \
   --wes-root "${WES_ROOT}" \
   --aa-root "${MERGED_AA}" \
   --classification-tsv "${MERGED_TSV}" \
