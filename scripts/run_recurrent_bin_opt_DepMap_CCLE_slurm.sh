@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=recurrent_bins_search
+#SBATCH --job-name=bayes_threshold_search
 #SBATCH --output=/home/sspandau/logs/%x_%j.out
 #SBATCH --error=/home/sspandau/logs/%x_%j.err
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 
@@ -13,6 +13,9 @@
 #   sbatch run_bayes_threshold_search.sh
 
 set -euo pipefail
+
+source /home/sspandau/miniconda3/etc/profile.d/conda.sh
+conda activate wes2wgs
 
 # ==========================================================================
 # CONFIG
@@ -71,7 +74,7 @@ echo "== Project dir: ${PROJECT_DIR}"
 
 BASE_SCRIPT="${SCRIPTS_DIR}/find_recurrent_novel_amplifications_binlevel.py"
 GRID_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold.py"
-BAYES_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold_wgstreemodel.py"
+BAYES_SCRIPT="${SCRIPTS_DIR}/optimize_recurrent_amplification_threshold_bayes.py"
 for f in "${BAYES_SCRIPT}" "${BASE_SCRIPT}" "${GRID_SCRIPT}"; do
     [[ -f "$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
@@ -314,19 +317,28 @@ EOF
 # ==========================================================================
 # STEP 3: run the search
 # ==========================================================================
-echo "== Starting OPT Search at $(date)"
-python3 "${OPT_SCRIPT}" \
+echo "== Starting Bayesian search at $(date)"
+python3 "${BAYES_SCRIPT}" \
   --wes-root "${WES_ROOT}" \
   --aa-root "${MERGED_AA}" \
   --classification-tsv "${MERGED_TSV}" \
   --classification-bed-dir "${MERGED_BED}" \
+  --base-script "${BASE_SCRIPT}" \
+  --grid-script "${GRID_SCRIPT}" \
   --column predicted_loess_upscale_depth \
   --mask-col mask_rejected \
   --rebin-to 25000 \
-  --quantiles "0.80:0.98:0.02" \
-  --min-samples-ratios "0.5:1:0.05" \
+  --smooth-window 1 \
+  --min-overlap-bp 1 \
+  --merge-gap 0 \
+  --method bayesian \
+  --quantile-bounds 0.80,0.99 \
+  --min-samples-ratio-bounds 0.05,1.0 \
+  --n-calls 40 \
+  --n-initial-points 10 \
+  --random-state 0 \
   --min-bin-instances-for-selection 30 \
-  --max-recurrent-fraction 0.15 \
+  --min-recurrent-regions 2 \
   --outdir "${OUTDIR}"
 
 echo "== Done at $(date). Results in ${OUTDIR}"
