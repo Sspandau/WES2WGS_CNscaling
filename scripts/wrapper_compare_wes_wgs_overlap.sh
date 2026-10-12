@@ -76,7 +76,7 @@ for SAMPLE_DIR in "$WES_ROOT"/*/; do
     echo "Submitting overlap job for sample: $SAMPLE"
     echo "  WES input: $WES_INPUT"
     echo "  WGS input: $WGS_INPUT"
-    sbatch /home/sspandau/WES2WGS_CNscaling/scripts/compare_wes_wgs_overlap_slurm.sh \
+    sbatch /home/sspandau/WES2WGS_CNscaling/scripts/compare_wes_wgs_overlap_grad_slurm.sh \
         "$WES_INPUT" \
         "$WGS_INPUT" \
         "$MASK_REGIONS" \

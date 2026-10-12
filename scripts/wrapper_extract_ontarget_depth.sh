@@ -3,12 +3,19 @@
 # Usage:
 #   bash wrapper_extract_ontarget_depth.sh <WES_WGS_MANIFEST> <ONTARGET_WINDOWS_AGILENT> <ONTARGET_WINDOWS_ILLUMINA> [OUTDIR_ROOT]
 #
+#   DRY_RUN=1   ... preview what would be submitted, submit nothing
+#   FORCE=1     ... resubmit every sample, even ones that already finished
+#
 # Submits one on-target depth extraction job per sample, reading WES_WGS_MANIFEST
 # (the merged wes_wgs_scaling_manifest_final.tsv from build_wes_wgs_scaling_manifest.py
 # + merge_wgs_sources.py) for each sample's already-resolved wes_path/wgs_path and
-# wes_baits, rather than re-deriving them here -- your actual WES/WGS BAMs sit as flat
-# CDS-ID-named files (not one directory per sample), so a fresh per-sample-directory
-# scan here would not find them; the manifest already solved that correctly.
+# wes_baits, rather than re-deriving them here.
+#
+# By default, samples whose output already exists
+#   <OUTDIR_ROOT>/<cell_line>/ontarget_depth_output/<cell_line>_on_target_depth.tsv
+# are SKIPPED, so re-running this only resubmits the samples that never finished
+# (e.g. the ones left with just a tmp/ folder). A leftover tmp/ from a failed run
+# is moved aside to tmp.failed_<timestamp> before resubmitting.
 #
 # Rows with both_found=False or both_indexed=False (no usable WGS from either source)
 # are skipped, same as wrapper_run_wes_wgs_scaling.sh.
@@ -17,6 +24,8 @@ WES_WGS_MANIFEST="${1:-}"
 ONTARGET_WINDOWS_AGILENT="${2:-}"
 ONTARGET_WINDOWS_ILLUMINA="${3:-}"
 OUTDIR_ROOT="${4:-}"
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
 
 declare -A BAITS_TO_WINDOWS
 
@@ -77,6 +86,8 @@ n_submitted=0
 n_failed_submit=0
 n_skipped_notusable=0
 n_skipped_unmapped=0
+n_skipped_done=0
+n_missing_bam=0
 
 while IFS=$'\x1f' read -r -a ROW; do
     ACH_ID="${ROW[$IDX_ACH]}"
@@ -101,6 +112,32 @@ while IFS=$'\x1f' read -r -a ROW; do
     fi
 
     OUTDIR="${OUTDIR_ROOT:-.}/${CELL_LINE}/ontarget_depth_output"
+    DONE_FILE="${OUTDIR}/${CELL_LINE}_on_target_depth.tsv"
+
+    # --- already finished? (non-empty output TSV) ---
+    if [ "$FORCE" != "1" ] && [ -s "$DONE_FILE" ]; then
+        n_skipped_done=$((n_skipped_done + 1))
+        continue
+    fi
+
+    # --- BAMs still where the manifest says? ---
+    if [ ! -f "$WES" ] || [ ! -f "$WGS" ]; then
+        echo "[skip] $ACH_ID / $CELL_LINE: BAM missing on disk (WES exists: $([ -f "$WES" ] && echo yes || echo no), WGS exists: $([ -f "$WGS" ] && echo yes || echo no))"
+        n_missing_bam=$((n_missing_bam + 1))
+        continue
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] would resubmit $ACH_ID / $CELL_LINE (baits='$BAITS')"
+        n_submitted=$((n_submitted + 1))
+        continue
+    fi
+
+    # move a stale tmp/ from a failed run out of the way
+    if [ -d "${OUTDIR}/tmp" ]; then
+        mv "${OUTDIR}/tmp" "${OUTDIR}/tmp.failed_$(date +%Y%m%d_%H%M%S)"
+    fi
+
     echo "Submitting on-target depth job for sample: $ACH_ID / $CELL_LINE (baits='$BAITS')"
     echo "  WES: $WES"
     echo "  WGS: $WGS"
@@ -113,4 +150,9 @@ while IFS=$'\x1f' read -r -a ROW; do
 done < <(tail -n +2 "$WES_WGS_MANIFEST" | tr '\t' '\037')
 
 echo ""
-echo "Actually submitted: $n_submitted   sbatch failures: $n_failed_submit   Not usable: $n_skipped_notusable   Skipped (unmapped baits): $n_skipped_unmapped"
+if [ "$DRY_RUN" = "1" ]; then
+    echo "DRY RUN -- would submit: $n_submitted"
+else
+    echo "Actually submitted: $n_submitted   sbatch failures: $n_failed_submit"
+fi
+echo "Already done (skipped): $n_skipped_done   BAM missing: $n_missing_bam   Not usable: $n_skipped_notusable   Unmapped baits: $n_skipped_unmapped"

@@ -111,6 +111,14 @@ OUTPUT (--outdir)
                               at least one sample
   best_combo_histogram.png   three-way histogram (blue / orange / recurrent)
                               styled like your example plot, for the winner
+  best_combo_wes_vs_wgs_scatter.png
+                              one point per (sample, bin): x = predicted
+                              loess WES depth (--column), y = WGS depth, with
+                              separate marker shapes for recurrent bins
+                              (winning combo), for bins inside an ecDNA
+                              feature of THAT SAME sample, and for bins that
+                              are both. Needs --wgs-depth-col in legacy mode
+                              (in --cv-csv mode --cv-raw-depth-col is used).
 """
 
 import argparse
@@ -175,6 +183,9 @@ def parse_grid(spec):
 # --------------------------------------------------------------------------
 
 FILENAME_SAMPLE_AMPLICON_RE = re.compile(r"^(?P<sample>.+)_amplicon(?P<num>\d+)_", re.IGNORECASE)
+
+# ecDNA feature BEDs specifically: <sample>_amplicon<N>_ecDNA_<i>_intervals.bed
+ECDNA_BED_RE = re.compile(r"^(?P<sample>.+)_amplicon(?P<num>\d+)_ecDNA_", re.IGNORECASE)
 
 
 def _normalize_class_label(s):
@@ -303,27 +314,59 @@ def index_classification_bed_dir(bed_dir):
     return index
 
 
-def load_orange_intervals_for_sample(sample_name, qualifying_amplicons, bed_index, base):
-    """Pools genomic intervals for one sample's qualifying amplicons using
-    the pre-built bed_index."""
+def index_ecdna_bed_files(bed_dir):
+    """Indexes ONLY AC's ecDNA feature BEDs
+    (<sample_name>_amplicon<N>_ecDNA_<i>_intervals.bed) by sample_name ->
+    [bed paths]. Used for the WES-vs-WGS scatter's ecDNA marker, which is
+    deliberately feature-level and independent of --orange-categories: an
+    ecDNA+ amplicon can also carry BFB/linear/CNC features, and only the
+    ecDNA feature's own intervals should get the ecDNA marker."""
+    bed_dir = Path(bed_dir)
+    index = {}
+    for bed_path in sorted(bed_dir.glob("*.bed")):
+        m = ECDNA_BED_RE.match(bed_path.name)
+        if not m:
+            continue
+        index.setdefault(m.group("sample"), []).append(bed_path)
+    n_files = sum(len(v) for v in index.values())
+    print(f"[ecdna-bed-index] {n_files} ecDNA feature BEDs across {len(index)} samples indexed from {bed_dir}")
+    return index
+
+
+def _read_bed_intervals(bed_paths, base):
+    """Reads and concatenates the first three columns of each BED in
+    bed_paths into one DataFrame[chrom, start, end]."""
     frames = []
-    for amp_num in qualifying_amplicons:
-        for bed_path in bed_index.get((sample_name, amp_num), []):
-            try:
-                df = pd.read_csv(bed_path, sep="\t", header=None, comment="#", engine="python")
-            except pd.errors.EmptyDataError:
-                continue
-            if df.empty or df.shape[1] < 3:
-                continue
-            df = df.iloc[:, :3].copy()
-            df.columns = ["chrom", "start", "end"]
-            df["chrom"] = df["chrom"].map(base.normalize_chrom)
-            df["start"] = df["start"].astype(int)
-            df["end"] = df["end"].astype(int)
-            frames.append(df)
+    for bed_path in bed_paths:
+        try:
+            df = pd.read_csv(bed_path, sep="\t", header=None, comment="#", engine="python")
+        except pd.errors.EmptyDataError:
+            continue
+        if df.empty or df.shape[1] < 3:
+            continue
+        df = df.iloc[:, :3].copy()
+        df.columns = ["chrom", "start", "end"]
+        df["chrom"] = df["chrom"].map(base.normalize_chrom)
+        df["start"] = df["start"].astype(int)
+        df["end"] = df["end"].astype(int)
+        frames.append(df)
     if not frames:
         return pd.DataFrame(columns=["chrom", "start", "end"])
     return pd.concat(frames, ignore_index=True)
+
+
+def load_orange_intervals_for_sample(sample_name, qualifying_amplicons, bed_index, base):
+    """Pools genomic intervals for one sample's qualifying amplicons using
+    the pre-built bed_index."""
+    paths = []
+    for amp_num in qualifying_amplicons:
+        paths.extend(bed_index.get((sample_name, amp_num), []))
+    return _read_bed_intervals(paths, base)
+
+
+def load_ecdna_intervals_for_sample(sample_name, ecdna_index, base):
+    """Pools the intervals of every ecDNA feature AC called in this sample."""
+    return _read_bed_intervals((ecdna_index or {}).get(sample_name, []), base)
 
 
 def load_sample_name_map(path):
@@ -354,17 +397,18 @@ def load_sample_name_map(path):
 def load_cv_predictions_csv(base, path, sample_col, chrom_col, start_col, value_col, raw_depth_col):
     """Reads ONE consolidated long-format CSV (all samples, all bins) such
     as cv_predictions.csv and splits it into a
-    {sample: DataFrame[chrom, start, value_raw, raw_depth]} dict with the
-    same column contract load_copy_ratio_with_raw_depth() produces for
-    legacy per-sample TSVs, so it drops straight into
+    {sample: DataFrame[chrom, start, value_raw, raw_depth, wgs_depth]} dict
+    with the same column contract load_copy_ratio_with_raw_depth() produces
+    for legacy per-sample TSVs, so it drops straight into
     rebin_mean_with_raw_depth() unchanged. value_col (default
     'oof_prediction', the model's predicted WGS depth) becomes value_raw --
     the thing that gets quantile-thresholded/pooled/plotted, exactly as
     predicted_loess_upscale_depth did in legacy mode. raw_depth_col
     (default 'y_wgs_tumor_depth', the observed WGS depth) becomes
-    raw_depth -- used only for --min-depth histogram filtering. There is no
-    mask/QC column in this format, so no masking is applied here (unlike
-    legacy mode's --mask-col)."""
+    raw_depth -- used for --min-depth plot filtering -- and is ALSO used as
+    wgs_depth, the x-axis of the WES-vs-WGS scatter. There is no mask/QC
+    column in this format, so no masking is applied here (unlike legacy
+    mode's --mask-col)."""
     sep = "\t" if str(path).lower().endswith((".tsv", ".txt")) else ","
     df = pd.read_csv(path, sep=sep, engine="python")
 
@@ -383,12 +427,13 @@ def load_cv_predictions_csv(base, path, sample_col, chrom_col, start_col, value_
         print(f"[warn] '{raw_depth_col}' column not found in {path} -- --min-depth filtering will be "
               f"skipped for all samples. Pass --cv-raw-depth-col if your column is named differently.")
         df["raw_depth"] = np.nan
+    df["wgs_depth"] = df["raw_depth"]
     df = df.dropna(subset=["value_raw", "start"])
 
     by_sample = {}
     for sample_name, grp in df.groupby(df[sample_col].astype(str).str.strip()):
         by_sample[sample_name] = (
-            grp[["chrom", "start", "value_raw", "raw_depth"]]
+            grp[["chrom", "start", "value_raw", "raw_depth", "wgs_depth"]]
             .sort_values(["chrom", "start"])
             .reset_index(drop=True)
         )
@@ -441,14 +486,15 @@ def load_seed_bed_manifest(path):
 # --------------------------------------------------------------------------
 
 def load_copy_ratio_with_raw_depth(base, path, value_col, mask_col, raw_depth_col,
-                                    chrom_col="chrom", start_col="start"):
+                                    chrom_col="chrom", start_col="start", wgs_depth_col=None):
     """Mirrors base.load_copy_ratio_tsv but additionally carries through a
-    raw depth column (e.g. raw_wes_depth) used ONLY for histogram plot
-    filtering (--min-depth). Kept separate from base.load_copy_ratio_tsv so
-    the original pipeline script's column contract never changes for its
-    other callers. If raw_depth_col isn't present in a sample's TSV, that
-    sample's raw_depth is set to NaN and a warning is printed once --
-    NaN is treated as 'unknown, don't filter out' downstream, not as fail-closed."""
+    raw depth column (e.g. raw_wes_depth) used ONLY for plot filtering
+    (--min-depth), and optionally a WGS depth column (wgs_depth_col) used
+    ONLY as the x-axis of the WES-vs-WGS scatter. Kept separate from
+    base.load_copy_ratio_tsv so the original pipeline script's column
+    contract never changes for its other callers. Missing columns become
+    NaN -- NaN raw_depth is treated as 'unknown, don't filter out'
+    downstream, and NaN wgs_depth points are simply left off the scatter."""
     sep = "\t" if str(path).lower().endswith((".tsv", ".txt")) else None
     df = pd.read_csv(path, sep=sep, engine="python")
 
@@ -464,6 +510,9 @@ def load_copy_ratio_with_raw_depth(base, path, value_col, mask_col, raw_depth_co
     has_raw_depth = raw_depth_col in df.columns
     df["raw_depth"] = df[raw_depth_col].astype(float) if has_raw_depth else np.nan
 
+    has_wgs_depth = bool(wgs_depth_col) and wgs_depth_col in df.columns
+    df["wgs_depth"] = df[wgs_depth_col].astype(float) if has_wgs_depth else np.nan
+
     df = df.dropna(subset=["value_raw", "start"])
 
     n_before = len(df)
@@ -471,18 +520,21 @@ def load_copy_ratio_with_raw_depth(base, path, value_col, mask_col, raw_depth_co
         df = df[df[mask_col].astype(float).fillna(0) == 0]
     n_after = len(df)
 
-    out = df[["chrom", "start", "value_raw", "raw_depth"]].sort_values(["chrom", "start"]).reset_index(drop=True)
-    return out, n_before, n_after, has_raw_depth
+    out = (df[["chrom", "start", "value_raw", "raw_depth", "wgs_depth"]]
+           .sort_values(["chrom", "start"]).reset_index(drop=True))
+    return out, n_before, n_after, has_raw_depth, has_wgs_depth
 
 
 def rebin_mean_with_raw_depth(df, new_bin_size):
-    """Same mean-aggregation as base.rebin_mean, plus raw_depth."""
+    """Same mean-aggregation as base.rebin_mean, plus raw_depth and wgs_depth."""
     df = df.copy()
+    if "wgs_depth" not in df.columns:
+        df["wgs_depth"] = np.nan
     df["bin_start"] = (df["start"] // new_bin_size) * new_bin_size
     agg = (
         df.groupby(["chrom", "bin_start"])
         .agg(value_raw=("value_raw", "mean"), raw_depth=("raw_depth", "mean"),
-             n_fine_bins=("value_raw", "size"))
+             wgs_depth=("wgs_depth", "mean"), n_fine_bins=("value_raw", "size"))
         .reset_index()
         .rename(columns={"bin_start": "start"})
     )
@@ -493,7 +545,7 @@ def rebin_mean_with_raw_depth(df, new_bin_size):
 def build_per_sample_cache(base, sample_table, column, mask_col, rebin_to,
                             smooth_window, min_overlap_bp, qualifying_by_sample,
                             bed_index, sample_name_map, raw_depth_col="raw_wes_depth",
-                            excluded_samples=None):
+                            excluded_samples=None, wgs_depth_col=None, ecdna_index=None):
     """LEGACY (--wes-root/--aa-root or --manifest) per-sample loader: reads
     one copy-ratio TSV + one seed BED per sample from disk. excluded_samples
     is the set of classification sample_names that don't get a vote in
@@ -501,11 +553,12 @@ def build_per_sample_cache(base, sample_table, column, mask_col, rebin_to,
     main())."""
     cache, skip_log = [], []
     warned_missing_raw_depth = False
+    n_missing_wgs_depth = 0
     excluded_samples = excluded_samples or set()
     for row in sample_table.itertuples(index=False):
         try:
-            raw_df, n_before, n_after, has_raw_depth = load_copy_ratio_with_raw_depth(
-                base, row.copy_ratio_tsv, column, mask_col, raw_depth_col)
+            raw_df, n_before, n_after, has_raw_depth, has_wgs_depth = load_copy_ratio_with_raw_depth(
+                base, row.copy_ratio_tsv, column, mask_col, raw_depth_col, wgs_depth_col=wgs_depth_col)
         except Exception as e:
             skip_log.append({"sample": row.sample, "stage": "load_copy_ratio_tsv", "reason": str(e)})
             continue
@@ -514,6 +567,11 @@ def build_per_sample_cache(base, sample_table, column, mask_col, rebin_to,
                   f"occurrence only) -- --min-depth filtering will be skipped for samples missing it. "
                   f"Pass --raw-depth-col if your column is named differently.")
             warned_missing_raw_depth = True
+        if wgs_depth_col and not has_wgs_depth:
+            if n_missing_wgs_depth == 0:
+                print(f"[warn] --wgs-depth-col '{wgs_depth_col}' not found in {row.copy_ratio_tsv} -- "
+                      f"this sample's bins will be left off the WES-vs-WGS scatter")
+            n_missing_wgs_depth += 1
         try:
             seeds_df = base.load_seed_bed(row.seed_bed)
         except Exception as e:
@@ -527,13 +585,16 @@ def build_per_sample_cache(base, sample_table, column, mask_col, rebin_to,
                   f"for classification sample_name '{classification_sample}' -- check --sample-map if "
                   f"your wes-root/aa-root sample ids don't match the classification TSV's sample_name column")
         orange_df = load_orange_intervals_for_sample(classification_sample, qualifying, bed_index, base)
+        ecdna_df = load_ecdna_intervals_for_sample(classification_sample, ecdna_index, base)
 
         binned = rebin_mean_with_raw_depth(raw_df, rebin_to)
         binned = base.smooth_per_chrom(binned, smooth_window)
         seed_flag = base.flag_seed_overlap(binned, seeds_df, min_overlap_bp)
         orange_flag = base.flag_seed_overlap(binned, orange_df, min_overlap_bp)
+        ecdna_flag = base.flag_seed_overlap(binned, ecdna_df, min_overlap_bp)
 
         n_orange_bins = int(orange_flag.sum())
+        n_ecdna_bins = int(ecdna_flag.sum())
         if n_orange_bins == 0 and qualifying:
             print(f"[warn] {row.sample}: {len(qualifying)} qualifying amplicons but 0 orange bins after "
                   f"BED lookup -- check that classification_bed_files filenames start with "
@@ -543,18 +604,22 @@ def build_per_sample_cache(base, sample_table, column, mask_col, rebin_to,
 
         cache.append({
             "sample": row.sample, "binned": binned,
-            "seed_flag": seed_flag, "orange_flag": orange_flag,
-            "n_orange_bins": n_orange_bins,
+            "seed_flag": seed_flag, "orange_flag": orange_flag, "ecdna_flag": ecdna_flag,
+            "n_orange_bins": n_orange_bins, "n_ecdna_bins": n_ecdna_bins,
             "excluded_from_recurrent": excluded_from_recurrent,
         })
         print(f"[cache] {row.sample}: {len(binned)} coarse bins, {n_orange_bins} orange bins "
-              f"({len(qualifying)} qualifying amplicons), "
+              f"({len(qualifying)} qualifying amplicons), {n_ecdna_bins} ecDNA bins, "
               f"{'EXCLUDED from recurrent-calling (ecDNA/BFB/CNC)' if excluded_from_recurrent else 'eligible for recurrent-calling'}")
+    if n_missing_wgs_depth:
+        print(f"[warn] {n_missing_wgs_depth} samples had no '{wgs_depth_col}' column and are absent "
+              f"from the WES-vs-WGS scatter")
     return cache, skip_log
 
 
 def build_per_sample_cache_cv(base, cv_data, seed_table, rebin_to, smooth_window, min_overlap_bp,
-                               qualifying_by_sample, bed_index, sample_name_map, excluded_samples=None):
+                               qualifying_by_sample, bed_index, sample_name_map, excluded_samples=None,
+                               ecdna_index=None):
     """--cv-csv counterpart of build_per_sample_cache(): identical
     rebin -> smooth -> seed-flag -> orange-flag pipeline, but sourced from
     the pre-split cv_data dict (from load_cv_predictions_csv) instead of
@@ -592,13 +657,16 @@ def build_per_sample_cache_cv(base, cv_data, seed_table, rebin_to, smooth_window
                   f"for classification sample_name '{classification_sample}' -- check --sample-map if "
                   f"your --cv-csv meta_sample values don't match the classification TSV's sample_name column")
         orange_df = load_orange_intervals_for_sample(classification_sample, qualifying, bed_index, base)
+        ecdna_df = load_ecdna_intervals_for_sample(classification_sample, ecdna_index, base)
 
         binned = rebin_mean_with_raw_depth(raw_df, rebin_to)
         binned = base.smooth_per_chrom(binned, smooth_window)
         seed_flag = base.flag_seed_overlap(binned, seeds_df, min_overlap_bp)
         orange_flag = base.flag_seed_overlap(binned, orange_df, min_overlap_bp)
+        ecdna_flag = base.flag_seed_overlap(binned, ecdna_df, min_overlap_bp)
 
         n_orange_bins = int(orange_flag.sum())
+        n_ecdna_bins = int(ecdna_flag.sum())
         if n_orange_bins == 0 and qualifying:
             print(f"[warn] {sample}: {len(qualifying)} qualifying amplicons but 0 orange bins after "
                   f"BED lookup -- check that classification_bed_files filenames start with "
@@ -608,12 +676,12 @@ def build_per_sample_cache_cv(base, cv_data, seed_table, rebin_to, smooth_window
 
         cache.append({
             "sample": sample, "binned": binned,
-            "seed_flag": seed_flag, "orange_flag": orange_flag,
-            "n_orange_bins": n_orange_bins,
+            "seed_flag": seed_flag, "orange_flag": orange_flag, "ecdna_flag": ecdna_flag,
+            "n_orange_bins": n_orange_bins, "n_ecdna_bins": n_ecdna_bins,
             "excluded_from_recurrent": excluded_from_recurrent,
         })
         print(f"[cache] {sample}: {len(binned)} coarse bins, {n_orange_bins} orange bins "
-              f"({len(qualifying)} qualifying amplicons), "
+              f"({len(qualifying)} qualifying amplicons), {n_ecdna_bins} ecDNA bins, "
               f"{'EXCLUDED from recurrent-calling (ecDNA/BFB/CNC)' if excluded_from_recurrent else 'eligible for recurrent-calling'}")
     return cache, skip_log
 
@@ -636,9 +704,15 @@ def pool_for_quantile(cache, quantile):
         # the legacy behavior which excluded them from voting entirely.
         is_novel_high = is_high & ~entry["orange_flag"]
 
+        ecdna_flag = entry.get("ecdna_flag")
+        if ecdna_flag is None:
+            ecdna_flag = np.zeros(len(binned), dtype=bool)
+        wgs = binned["wgs_depth"] if "wgs_depth" in binned.columns else np.nan
+
         all_frames.append(
             binned.loc[:, ["chrom", "start", "end", "value_raw", "raw_depth"]]
-            .assign(sample=entry["sample"], is_orange=entry["orange_flag"])
+            .assign(wgs_depth=wgs, sample=entry["sample"], is_orange=entry["orange_flag"],
+                    is_ecdna=ecdna_flag)
         )
         # samples with a known ecDNA+/BFB+/CNC amplicon don't get a vote in
         # what counts as "recurrent" -- their complex amplicon architecture
@@ -655,7 +729,8 @@ def pool_for_quantile(cache, quantile):
             .assign(sample=entry["sample"])
         )
     cols_novel = ["chrom", "start", "end", "value_raw", "sample"]
-    cols_all = ["chrom", "start", "end", "value_raw", "raw_depth", "sample", "is_orange"]
+    cols_all = ["chrom", "start", "end", "value_raw", "raw_depth", "wgs_depth", "sample",
+                "is_orange", "is_ecdna"]
     pooled_novel = pd.concat(novel_frames, ignore_index=True) if novel_frames else pd.DataFrame(columns=cols_novel)
     pooled_all = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame(columns=cols_all)
     return pooled_novel, pooled_all
@@ -986,6 +1061,89 @@ def plot_single_sample_histogram(cache, quantile, min_samples, min_samples_ratio
     print(f"Saved: {out_path}")
 
 
+def plot_wes_vs_wgs_scatter(cache, quantile, min_samples, min_samples_ratio, out_path,
+                             x_label, y_label, min_depth=0.1, highlight_sample=None):
+    """One point per (sample, bin) instance: x = that sample's predicted
+    loess WES depth (value_raw) for the bin, y = that sample's WGS depth for
+    the bin. The same genomic bin therefore appears once per sample, at
+    different coordinates. Marker shape encodes:
+        recurrent   -- bin LOCATION was called recurrent at this combo
+                       (labels are location-level, so every sample's copy
+                       of a recurrent bin gets this marker)
+        ecDNA       -- bin overlaps an AC ecDNA feature called in THIS
+                       point's own source sample
+        both        -- recurrent location AND inside this sample's ecDNA
+        other       -- everything else (incl. BFB/CNC/FAN orange bins)
+    Points are drawn in that z-order (other at the back), all of them --
+    nothing is subsampled. --min-depth is applied on raw depth, same as the
+    histograms; points with NaN or non-positive x or y can't sit on log
+    axes and are dropped (counts are printed)."""
+    pooled_novel, pooled_all = pool_for_quantile(cache, quantile)
+    merged, _ = label_recurrent(pooled_novel, pooled_all, min_samples)
+    context = "[scatter] "
+    if highlight_sample is not None:
+        merged = merged[merged["sample"] == highlight_sample]
+        context = f"[scatter {highlight_sample}] "
+        if merged.empty:
+            print(f"[warn] --highlight-sample '{highlight_sample}' not found -- skipping {out_path}")
+            return
+    merged = _apply_min_depth_filter(merged, min_depth, context_label=context)
+
+    x = merged["value_raw"].to_numpy(dtype=float)
+    y = merged["wgs_depth"].to_numpy(dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        print(f"[warn] {context}no bin-instances have a WGS depth value -- skipping {out_path}. "
+              f"Check --wgs-depth-col (legacy mode) / --cv-raw-depth-col (--cv-csv mode).")
+        return
+    keep = finite & (x > 0) & (y > 0)
+    n_nan, n_nonpos = int((~finite).sum()), int((finite & ~keep).sum())
+    if n_nan or n_nonpos:
+        print(f"[info] {context}dropped {n_nan:,} bin-instances with missing WGS/WES depth and "
+              f"{n_nonpos:,} with depth <= 0 (can't be shown on log axes)")
+
+    is_rec = merged["is_recurrent"].to_numpy(dtype=bool) & keep
+    is_ec = merged["is_ecdna"].to_numpy(dtype=bool) & keep
+    groups = [
+        # label, mask, marker, size, color, alpha
+        ("Other bins", keep & ~is_rec & ~is_ec, ".", 1.0, "#9a9a9a", 0.25),
+        ("Recurrent bins", is_rec & ~is_ec, "^", 2.0, "#7b3fa0", 0.5),
+        ("ecDNA bins (ecDNA in source sample)", is_ec & ~is_rec, "s", 2.5, "#e07b00", 0.75),
+        ("ecDNA AND recurrent", is_ec & is_rec, "D", 3.0, "#c0143c", 0.9),
+    ]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    for label, mask, marker, size, color, alpha in groups:
+        n = int(mask.sum())
+        print(f"[info] {context}{label}: {n:,} points")
+        if n == 0:
+            continue
+        # ax.plot with markers is much faster than ax.scatter at tens of
+        # millions of points; rasterized keeps the PNG/any vector export small
+        ax.plot(x[mask], y[mask], linestyle="none", marker=marker, markersize=size,
+                markeredgewidth=0, color=color, alpha=alpha, rasterized=True,
+                label=f"{label} (n={n:,})")
+
+    lo = min(x[keep].min(), y[keep].min())
+    hi = max(x[keep].max(), y[keep].max())
+    ax.plot([lo, hi], [lo, hi], color="black", lw=1, ls="--", label="y = x")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    subtitle = f"sample: {highlight_sample}" if highlight_sample else \
+        f"all samples pooled, one point per (sample, bin), n={int(keep.sum()):,}"
+    ax.set_title(f"Best combo: quantile={quantile}, min_samples_ratio={min_samples_ratio} "
+                 f"(min_samples={min_samples})\n{subtitle}")
+    leg = ax.legend(loc="upper left", markerscale=4, fontsize=8)
+    for h in getattr(leg, "legend_handles", None) or getattr(leg, "legendHandles", []):
+        h.set_alpha(1)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -1077,17 +1235,26 @@ def main():
     p.add_argument("--outdir", default="ecdna_bfb_cnc_threshold_search")
     p.add_argument("--highlight-sample", default=None,
                     help="A sample id (wes-root/aa-root id in legacy mode, or meta_sample value in "
-                         "--cv-csv mode) -- if set, also produce a single-sample version of "
-                         "best_combo_histogram.png filtered to just that sample's own bins, matching "
-                         "the original per-sample plot style")
+                         "--cv-csv mode) -- if set, also produce single-sample versions of "
+                         "best_combo_histogram.png and best_combo_wes_vs_wgs_scatter.png filtered to "
+                         "just that sample's own bins")
     p.add_argument("--min-depth", type=float, default=0.1,
-                    help="Histogram plots (best_combo_histogram*.png) only include bins with raw depth "
-                         "above this value. Does not affect the optimization/search itself, only what's "
-                         "drawn.")
+                    help="Plots (best_combo_histogram*.png and best_combo_wes_vs_wgs_scatter*.png) only "
+                         "include bins with raw depth above this value. Does not affect the "
+                         "optimization/search itself, only what's drawn.")
     p.add_argument("--raw-depth-col", default="raw_wes_depth",
                     help="LEGACY mode only: column name in the copy-ratio TSVs used for --min-depth "
                          "filtering. Separate from --column (the value that's actually plotted/"
                          "optimized on). Use --cv-raw-depth-col in --cv-csv mode.")
+    p.add_argument("--wgs-depth-col", default=None,
+                    help="LEGACY mode only: column in each sample's copy-ratio TSV holding the observed "
+                         "WGS depth for that bin. Used ONLY as the x-axis of "
+                         "best_combo_wes_vs_wgs_scatter.png (averaged into --rebin-to bins the same way "
+                         "as --column). If omitted, the scatter is skipped in legacy mode. In --cv-csv "
+                         "mode --cv-raw-depth-col is used instead.")
+    p.add_argument("--no-wes-wgs-scatter", action="store_true",
+                    help="Skip best_combo_wes_vs_wgs_scatter.png (it draws every bin-instance, which "
+                         "can take a few minutes at genome-wide scale).")
 
     # --- --cv-csv mode ---------------------------------------------------
     p.add_argument("--cv-csv", default=None,
@@ -1103,9 +1270,9 @@ def main():
                     help="Column used as the plotted/optimized depth value (--cv-csv mode's analogue "
                          "of --column). Default 'oof_prediction' -- the model's predicted WGS depth.")
     p.add_argument("--cv-raw-depth-col", default="y_wgs_tumor_depth",
-                    help="Column used only for --min-depth histogram filtering (--cv-csv mode's "
-                         "analogue of --raw-depth-col). Default 'y_wgs_tumor_depth', the observed "
-                         "WGS depth.")
+                    help="Column used for --min-depth plot filtering (--cv-csv mode's analogue of "
+                         "--raw-depth-col) and as the x-axis of the WES-vs-WGS scatter. Default "
+                         "'y_wgs_tumor_depth', the observed WGS depth.")
     p.add_argument("--seed-bed-manifest", default=None,
                     help="--cv-csv mode only: TSV/CSV with columns 'sample','seed_bed' giving each "
                          "sample's AA_CNV_SEEDS.bed path. If omitted, falls back to globbing --aa-root "
@@ -1172,18 +1339,21 @@ def main():
               f"eligible to be labeled recurrent if voted so by the included samples.")
 
     bed_index = index_classification_bed_dir(args.classification_bed_dir)
+    ecdna_index = index_ecdna_bed_files(args.classification_bed_dir)
 
     sample_name_map = load_sample_name_map(args.sample_map) if args.sample_map else {}
 
     if args.cv_csv:
         cache, more_skips = build_per_sample_cache_cv(
             base, cv_data, seed_table, args.rebin_to, args.smooth_window, args.min_overlap_bp,
-            qualifying_by_sample, bed_index, sample_name_map, excluded_samples)
+            qualifying_by_sample, bed_index, sample_name_map, excluded_samples,
+            ecdna_index=ecdna_index)
     else:
         cache, more_skips = build_per_sample_cache(
             base, sample_table, args.column, args.mask_col, args.rebin_to,
             args.smooth_window, args.min_overlap_bp, qualifying_by_sample, bed_index, sample_name_map,
-            args.raw_depth_col, excluded_samples
+            args.raw_depth_col, excluded_samples,
+            wgs_depth_col=args.wgs_depth_col, ecdna_index=ecdna_index,
         )
     skip_log += more_skips
     if not cache:
@@ -1196,6 +1366,11 @@ def main():
                  "--classification-bed-dir filenames follow the "
                  "'<sample_name>_amplicon<N>_..._intervals.bed' convention -- see the per-sample "
                  "[warn] lines above.")
+    total_ecdna = sum(e.get("n_ecdna_bins", 0) for e in cache)
+    print(f"Total ecDNA bin-instances (feature-level, for the WES-vs-WGS scatter): {total_ecdna:,}")
+    if total_ecdna == 0:
+        print("[warn] 0 ecDNA bins found -- the scatter will have no ecDNA markers. Check that "
+              "--classification-bed-dir contains '<sample>_amplicon<N>_ecDNA_<i>_intervals.bed' files.")
 
     quantiles = parse_grid(args.quantiles)
     min_samples_ratios = parse_grid(args.min_samples_ratios)
@@ -1269,12 +1444,40 @@ def main():
         print(f"Recurrent bin locations overlapping orange: {n_overlap}/{n_rec} "
               f"({n_overlap / n_rec:.1%})" if n_rec else "Recurrent bin locations overlapping orange: 0/0")
 
+        bin_kb = f"{args.rebin_to / 1000:g} kb"
+        if args.cv_csv:
+            scatter_x_label = f"WGS depth ({args.cv_raw_depth_col}, mean per {bin_kb} bin)"
+            scatter_y_label = f"{args.cv_value_col} (mean per {bin_kb} bin)"
+            make_scatter = True
+        else:
+            scatter_x_label = f"WGS depth ({args.wgs_depth_col}, mean per {bin_kb} bin)"
+            scatter_y_label = f"Predicted loess WES depth ({args.column}, mean per {bin_kb} bin)"
+            make_scatter = bool(args.wgs_depth_col)
+            if not make_scatter:
+                print("[info] --wgs-depth-col not given -- skipping best_combo_wes_vs_wgs_scatter.png")
+        make_scatter = make_scatter and not args.no_wes_wgs_scatter
+
+        if make_scatter:
+            plot_wes_vs_wgs_scatter(
+                cache, best_row["quantile"], int(best_row["min_samples"]), best_row["min_samples_ratio"],
+                outdir / "best_combo_wes_vs_wgs_scatter.png", scatter_y_label, scatter_x_label,
+                min_depth=args.min_depth,
+            )
+
         if args.highlight_sample:
             plot_single_sample_histogram(
                 cache, best_row["quantile"], int(best_row["min_samples"]),
                 best_row["min_samples_ratio"], args.highlight_sample,
                 outdir / f"best_combo_histogram_{args.highlight_sample}.png", min_depth=args.min_depth,
             )
+            if make_scatter:
+                plot_wes_vs_wgs_scatter(
+                    cache, best_row["quantile"], int(best_row["min_samples"]),
+                    best_row["min_samples_ratio"],
+                    outdir / f"best_combo_wes_vs_wgs_scatter_{args.highlight_sample}.png",
+                    scatter_y_label, scatter_x_label, min_depth=args.min_depth,
+                    highlight_sample=args.highlight_sample,
+                )
     else:
         print("No eligible combo found -- see best_combo_summary.txt.")
 

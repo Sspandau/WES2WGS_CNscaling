@@ -20,17 +20,31 @@ a WGS Panel of Normals (PoN) as the reference baseline.
 
 Normalization strategy:
 - Raw WES off-target depth is compared directly to the PoN median at each window.
-- GC bias (and secondary distance-to-target bias) is estimated and corrected 
+- GC bias (and secondary distance-to-target bias) is estimated and corrected
   using a robust 2D LOESS local linear regression directly from the raw ratios.
 - Output log2 copy ratios are directly comparable to WGS copy ratios.
+
+PATCH (--reference_fasta): the original run_mosdepth() never passed a reference
+to mosdepth, which is fine for BAM input but means CRAM decoding falls back to
+htslib's automatic M5-checksum reference lookup (a local REF_CACHE if one is
+configured, otherwise a network fetch from EBI's public CRAM reference server
+per region). That can be slow, or fail outright on a compute node without
+internet egress. Passing --reference_fasta gives mosdepth a local FASTA to
+decode CRAM inputs from directly -- no behavior change for BAM inputs, and no
+behavior change at all if --reference_fasta is omitted.
 '''
 
-def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, min_mapq=15):
+def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, min_mapq=15, reference_fasta=None):
     """
     Runs mosdepth to pull clean window read counts.
     Filters: MAPQ >= min_mapq (excludes individual reads with low mapping
     quality, i.e. low-mappability reads, before depth is ever computed),
     excludes duplicates, supplementary, non-primary, and QC-fail reads.
+
+    reference_fasta: if given, passed to mosdepth as --fasta. Required in
+    practice for reliable CRAM decoding (see module docstring); has no effect
+    on BAM input beyond mosdepth accepting-and-ignoring the flag for formats
+    that don't need it.
     """
     cmd = [
         "mosdepth",
@@ -39,9 +53,10 @@ def run_mosdepth(bam_path, bed_path, output_prefix, threads=4, min_mapq=15):
         "--mapq", str(min_mapq),
         "--flag", "3844",
         "--no-per-base",
-        output_prefix,
-        bam_path
     ]
+    if reference_fasta:
+        cmd += ["--fasta", reference_fasta]
+    cmd += [output_prefix, bam_path]
     subprocess.run(cmd, check=True)
 
 
@@ -167,32 +182,32 @@ def apply_pon_multivariate_lr(raw_wes_depth, pon_median, wgs_tumor_depth, offtar
         ('lgbm', LGBMRegressor(n_estimators=100, random_state=42)),
         ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
         ('svr', SVR(kernel='rbf', C=1.0))]
-    
+
     #define meta model for stack
     meta_model = Ridge()
 
     #stacked model with 5k CV
     stack_pipeline = StackingRegressor(
         estimators=base_models, final_estimator=meta_model, cv=5, n_jobs=-1)
-    
+
     #initialize and filter x and y
     df_fit = pd.DataFrame({"y": wgs_tumor_depth,
-                           "wes_depth" : raw_wes_depth, "pon_depth" : pon_median, "gc" : offtarget_gc, 
+                           "wes_depth" : raw_wes_depth, "pon_depth" : pon_median, "gc" : offtarget_gc,
                            "chrom" : chr, "dist" : dist_to_target
     })
 
     valid_mask = (
-            (df_fit['wes_depth'] > 0) & 
-            (~df_fit['gc'].isna()) & 
+            (df_fit['wes_depth'] > 0) &
+            (~df_fit['gc'].isna()) &
             (~df_fit['dist'].isna()) #may need to add more filtering
         )
-    
+
     y = df_fit.loc[valid_mask, 'y'].values
     wes_train = df_fit.loc[valid_mask, 'wes_depth'].values
     pon_train = df_fit.loc[valid_mask, 'pon_depth'].values
     gc_train = df_fit.loc[valid_mask, 'gc'].values
     dist_train = df_fit.loc[valid_mask, 'dist'].values
-    chr_train = df_fit.loc[valid_mask, 'chrom'].values 
+    chr_train = df_fit.loc[valid_mask, 'chrom'].values
 
     X = pd.DataFrame({
         "wes_depth" : wes_train, "pon_depth": pon_train, "gc" : gc_train, "dist": dist_train
@@ -201,10 +216,10 @@ def apply_pon_multivariate_lr(raw_wes_depth, pon_median, wgs_tumor_depth, offtar
     #cross validation by chromosome
     outer_cv = GroupKFold(n_splits=5)
     cv_results = cross_validate(
-    stack_pipeline, 
-    X, y, 
+    stack_pipeline,
+    X, y,
     groups=chr_train, #split by chromosome to emulate fitting to independent regions (as seen in LOESS)
-    cv=outer_cv, 
+    cv=outer_cv,
     scoring=['r2', 'neg_mean_absolute_error'],
     n_jobs=-1)
 
@@ -214,7 +229,6 @@ def apply_pon_multivariate_lr(raw_wes_depth, pon_median, wgs_tumor_depth, offtar
     full_predictions[valid_mask] = predictions
 
     return cv_results, full_predictions
-    
 
 
 
@@ -230,8 +244,14 @@ def main():
     p.add_argument("--wes_dir", required=True,
                    help="Directory containing tumor WES BAMs")
     p.add_argument("--wgs_bam", default=None,
-                   help="Path to the matched tumor WGS BAM. "
+                   help="Path to the matched tumor WGS BAM or CRAM. "
                         "If omitted, wgs_tumor_depth will be filled with NaN.")
+    p.add_argument("--reference_fasta", default=None,
+                   help="Reference FASTA, passed to mosdepth as --fasta. Not required for "
+                        "BAM input, but needed in practice for reliable CRAM decoding -- "
+                        "without it, mosdepth falls back to htslib's automatic M5-checksum "
+                        "reference lookup, which can be slow or fail on a compute node "
+                        "without internet egress.")
     p.add_argument("-t", metavar="INT", type=int,
                    default=4, help="Threads per mosdepth run")
     p.add_argument("--min_mapq", metavar="INT", type=int, default=15,
@@ -248,6 +268,7 @@ def main():
     PON_TSV        = args.pon_tsv
     TUMOR_BAM_DIR  = args.wes_dir
     WGS_BAM        = args.wgs_bam
+    REFERENCE_FASTA = args.reference_fasta
     THREADS        = args.t
     MIN_MAPQ       = args.min_mapq
     OUTPUT_DIR     = args.output_dir
@@ -255,6 +276,10 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)
+
+    if REFERENCE_FASTA and not os.path.exists(REFERENCE_FASTA):
+        print(f"[-] Error: --reference_fasta given but not found: {REFERENCE_FASTA}")
+        return
 
     tumor_bams = glob.glob(os.path.join(TUMOR_BAM_DIR, "*.bam"))
     if not tumor_bams:
@@ -271,7 +296,7 @@ def main():
 
     pon_median     = df_pon['pon_median'].values
     pon_variance   = df_pon['pon_variance'].values
-    
+
     gc_col = 'gc_pct' if 'gc_pct' in df_pon.columns else ('gc' if 'gc' in df_pon.columns else None)
     offtarget_gc = df_pon[gc_col].values if gc_col else np.full(len(df_pon), np.nan)
     dist_to_target = df_pon['dist_to_target'].values if 'dist_to_target' in df_pon.columns else None
@@ -279,6 +304,8 @@ def main():
 
     print(f"[+] PoN loaded: {len(df_pon)} windows.")
     print(f"[+] Found {len(tumor_bams)} tumor WES BAMs to process.")
+    if REFERENCE_FASTA:
+        print(f"[+] Using reference FASTA for mosdepth (needed for CRAM decoding): {REFERENCE_FASTA}")
 
     for bam_path in tumor_bams:
         sample_name = os.path.basename(bam_path).split('.')[0]
@@ -289,6 +316,8 @@ def main():
         prefix_off = os.path.join(TMP_DIR, f"{sample_name}_off_target")
         print(f"    -> Running mosdepth on off-target windows (WES), "
               f"excluding reads with MAPQ < {MIN_MAPQ}...")
+        # WES input is always a local BAM (globbed above), so no reference needed here --
+        # only the WGS call below actually needs --fasta for CRAM.
         run_mosdepth(bam_path, OFFTARGET_BED, prefix_off, threads=THREADS, min_mapq=MIN_MAPQ)
         df_off = parse_mosdepth_regions(prefix_off)
 
@@ -309,7 +338,8 @@ def main():
                 prefix_wgs = os.path.join(TMP_DIR, f"{sample_name}_wgs_tumor")
                 print(f"    -> Running mosdepth on matched tumor WGS BAM: {os.path.basename(WGS_BAM)} "
                       f"(excluding reads with MAPQ < {MIN_MAPQ})...")
-                run_mosdepth(WGS_BAM, OFFTARGET_BED, prefix_wgs, threads=THREADS, min_mapq=MIN_MAPQ)
+                run_mosdepth(WGS_BAM, OFFTARGET_BED, prefix_wgs, threads=THREADS,
+                            min_mapq=MIN_MAPQ, reference_fasta=REFERENCE_FASTA)
                 df_wgs = parse_mosdepth_regions(prefix_wgs)
                 if len(df_wgs) != len(df_pon):
                     print(f"    [-] Warning: WGS window count mismatch — "
@@ -325,18 +355,11 @@ def main():
         depth_scaled = apply_pon_multivariate_loess_correction(
             raw_wes_depth, pon_median, offtarget_gc, dist_to_target)
 
-  #      if dist_to_target is not None:
-  #          print(f"    -> Computing LR between raw WES depth and tumor WGS...")
- #           cv_results, predicted_wgs_depth = apply_pon_multivariate_lr(raw_wes_depth, pon_median, wgs_tumor_depth, offtarget_gc, chromosomes, dist_to_target)
-#        else:
- #           print("    [-] Warning: dist_to_target not available. Skipping multivariate LR for WGS prediction.")
-
-
         print(f"    -> Applying quality filters...")
         pon_sd = np.sqrt(np.maximum(pon_variance, 0))
         safe_pon_median = np.where(pon_median > 0, pon_median, 1.0)
         pon_cv = np.where(pon_median > 0, pon_sd / safe_pon_median, 0)
-        
+
         flag_high_cv = (pon_cv > 0.30).astype(int)
         flag_zero_wes = (raw_wes_depth == 0).astype(int)
 
@@ -362,15 +385,11 @@ def main():
         df_output['gc_pct'] = offtarget_gc
         df_output['dist_to_target'] = dist_to_target if dist_to_target is not None else np.nan
         df_output['raw_wes_depth']      = raw_wes_depth
-        df_output['pon_median_wgs']     = pon_median 
+        df_output['pon_median_wgs']     = pon_median
         df_output['depth_scaled_ratio'] = depth_scaled
         df_output['pon_cv']             = pon_cv
 
         df_output['predicted_loess_upscale_depth'] = pon_median * depth_scaled
-#        df_output['predicted_lr_upscale_depth'] = predicted_wgs_depth if dist_to_target is not None else np.nan
-
- #       max_theoretical_depth = pon_median * 200.0
-#        df_output['predicted_loess_upscale_depth'] = np.minimum(df_output['predicted_upscale_depth'], max_theoretical_depth)
         df_output['wgs_tumor_depth'] = wgs_tumor_depth
 
         df_output['flag_high_cv']         = flag_high_cv
@@ -388,7 +407,7 @@ def main():
         n_usable  = (master_mask == 0).sum()
         n_total   = len(df_output)
         wgs_covered = (~np.isnan(wgs_tumor_depth)).sum()
-        
+
         print(f"    [-] Saved: {output_path}")
         print(f"    -> Usable windows:                  {n_usable} / {n_total}")
         print(f"    -> Dropped (zero WES depth):        {flag_zero_wes.sum()}")
@@ -398,5 +417,9 @@ def main():
         print(f"    -> WGS tumor windows with depth:    {wgs_covered} / {n_total}")
 
     print("\n" + "="*55)
-    print("[+] scale_WES_tracks.py COMPLETE")
+    print("[+] scale_WES_tracks_withmatchedWGS.py COMPLETE")
     print("    All tumor samples normalized to WGS PoN scale with robust LOESS.")
+
+
+if __name__ == "__main__":
+    main()
