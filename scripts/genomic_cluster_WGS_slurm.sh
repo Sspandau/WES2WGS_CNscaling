@@ -8,7 +8,7 @@
 
 # Clustering on the WGS tumor depth column of the same per-sample file used for WES.
 # No mask regions, no WES/WGS comparison.
-#genomic_cluster_WGS_slurm.sh
+#
 # Usage: sbatch genomic_cluster_WGS_slurm.sh INPUT_TSV [WGS_COLUMN] [REBIN_TO|none]
 
 set -euo pipefail
@@ -30,8 +30,11 @@ PREFIX="${FILENAME%_off_target_copy_ratios.tsv}"
 OUTDIR="${BASE_DIR}/${PREFIX}_wgs_cluster_results"
 mkdir -p "$OUTDIR"
 
+# conda activate hooks (e.g. openjdk's JAVA_HOME) reference unset vars, so relax -u here
+set +u
 source /home/sspandau/miniconda3/etc/profile.d/conda.sh
 conda activate cfamp
+set -u
 
 echo "Starting WGS clustering for: $FILENAME (column: $WGS_COLUMN)"
 echo "Outputting to: $OUTDIR"
