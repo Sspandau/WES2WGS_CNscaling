@@ -9,16 +9,21 @@
 # Clustering on the WGS tumor depth column of the same per-sample file used for WES.
 # No mask regions, no WES/WGS comparison.
 #
-# Usage: sbatch genomic_cluster_WGS_slurm.sh INPUT_TSV [WGS_COLUMN] [REBIN_TO|none]
+# Usage: sbatch genomic_cluster_WGS_slurm.sh INPUT_TSV [WGS_COLUMN] [REBIN_TO|none] [MAX_GAP] [MIN_REL_CN|none]
+#
+#   MAX_GAP     fixed number of non-high bins allowed inside a cluster (default 2), or 'auto'
+#   MIN_REL_CN  absolute floor for 'high', in multiples of the sample's mean depth (default 3)
 
 set -euo pipefail
 
 INPUT_TSV="${1:-}"
 WGS_COLUMN="${2:-wgs_tumor_depth}"
 REBIN_TO="${3:-25000}"
+MAX_GAP="${4:-2}"
+MIN_REL_CN="${5:-3}"
 
 if [ -z "$INPUT_TSV" ]; then
-    echo "Usage: sbatch genomic_cluster_WGS_slurm.sh INPUT_TSV [WGS_COLUMN] [REBIN_TO|none]" >&2
+    echo "Usage: sbatch genomic_cluster_WGS_slurm.sh INPUT_TSV [WGS_COLUMN] [REBIN_TO|none] [MAX_GAP] [MIN_REL_CN|none]" >&2
     exit 1
 fi
 
@@ -36,17 +41,20 @@ source /home/sspandau/miniconda3/etc/profile.d/conda.sh
 conda activate cfamp
 set -u
 
-echo "Starting WGS clustering for: $FILENAME (column: $WGS_COLUMN)"
+echo "Starting WGS clustering for: $FILENAME (column: $WGS_COLUMN, max-gap: $MAX_GAP, min-rel-cn: $MIN_REL_CN)"
 echo "Outputting to: $OUTDIR"
 
 ARGS=(
     --input "$INPUT_TSV"
     --column "$WGS_COLUMN"
-    --max-gap auto
+    --max-gap "$MAX_GAP"
     --outdir "$OUTDIR"
 )
 if [ "$REBIN_TO" != "none" ]; then
     ARGS+=(--rebin-to "$REBIN_TO")
+fi
+if [ "$MIN_REL_CN" != "none" ]; then
+    ARGS+=(--min-rel-cn "$MIN_REL_CN")
 fi
 
 python3 /home/sspandau/WES2WGS_CNscaling/scripts/genomic_cluster_upscaleddepth.py "${ARGS[@]}"

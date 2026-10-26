@@ -11,7 +11,7 @@
 # overwrite the WES <SRR>_cluster_results/.
 #
 # Usage:
-#   bash wrapper_depmap_ccle_genomic_cluster_WGS.sh [WGS_COLUMN] [REBIN_TO|none]
+#   bash wrapper_depmap_ccle_genomic_cluster_WGS.sh [WGS_COLUMN] [REBIN_TO|none] [MAX_GAP] [MIN_REL_CN|none]
 #   DRY_RUN=1 bash wrapper_depmap_ccle_genomic_cluster_WGS.sh   # preview, submit nothing
 # ==========================================================================
 set -euo pipefail
@@ -22,6 +22,8 @@ WES_PATTERN="*_off_target_copy_ratios.tsv"        # found anywhere below each sa
 
 WGS_COLUMN="${1:-wgs_tumor_depth}"                # WGS column inside the same TSV
 REBIN_TO="${2:-25000}"                            # "none" to skip rebinning
+MAX_GAP="${3:-2}"                                 # fixed gap in bins, or "auto"
+MIN_REL_CN="${4:-3}"                              # floor for "high" (x mean depth), or "none"
 
 CLUSTER_SCRIPT="/home/sspandau/WES2WGS_CNscaling/scripts/genomic_cluster_WGS_slurm.sh"
 MANIFEST="${MANIFEST:-/metropolis/projects/sspandau/depmap/genomic_cluster_WGS_manifest.tsv}"
@@ -78,10 +80,10 @@ while IFS=$'\t' read -r SAMPLE TSV_FILE STATUS; do
     esac
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        echo "[dry-run] ${SAMPLE}: ${TSV_FILE} (column ${WGS_COLUMN}, rebin ${REBIN_TO})"
+        echo "[dry-run] ${SAMPLE}: ${TSV_FILE} (column ${WGS_COLUMN}, rebin ${REBIN_TO}, max-gap ${MAX_GAP}, min-rel-cn ${MIN_REL_CN})"
     else
         echo "Submitting WGS clustering job for sample: ${SAMPLE}"
-        sbatch "$CLUSTER_SCRIPT" "$TSV_FILE" "$WGS_COLUMN" "$REBIN_TO"
+        sbatch "$CLUSTER_SCRIPT" "$TSV_FILE" "$WGS_COLUMN" "$REBIN_TO" "$MAX_GAP" "$MIN_REL_CN"
     fi
     n_sub=$((n_sub + 1))
 done < <(tail -n +2 "$MANIFEST")

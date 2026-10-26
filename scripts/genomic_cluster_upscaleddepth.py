@@ -58,7 +58,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.ndimage import binary_closing
 
 
 # --------------------------------------------------------------------------
@@ -320,19 +319,48 @@ def suggest_max_gap_from_acf(sub, value_col, max_lag=20, alpha=0.05):
     return max(suggested, 0)
 
 
-def resolve_max_gap(df, value_col, max_gap_arg, max_lag=20):
+def resolve_max_gap(df, value_col, max_gap_arg, max_lag=20, cap=None):
     """Returns a dict {chrom: max_gap} regardless of whether the user
-    passed a fixed integer or 'auto'."""
+    passed a fixed integer or 'auto'. With 'auto', `cap` (if given) limits
+    the value on every chromosome."""
     chroms = df["chrom"].unique()
     if max_gap_arg == "auto":
         gaps = {}
         for chrom in chroms:
             sub = df[df["chrom"] == chrom].sort_values("start")
             gaps[chrom] = suggest_max_gap_from_acf(sub, value_col, max_lag)
+        n_sat = sum(g >= max_lag for g in gaps.values())
+        if n_sat > len(gaps) / 2:
+            print(f"Warning: auto max-gap hit the search limit ({max_lag}) on {n_sat}/{len(gaps)} "
+                  f"chromosomes. The signal stays autocorrelated over long distances (typical of "
+                  f"WGS copy-number segments), so 'auto' is not informative here; consider a "
+                  f"fixed --max-gap or --max-gap-cap.")
+        if cap is not None:
+            gaps = {c: min(g, cap) for c, g in gaps.items()}
         return gaps
     else:
         fixed = int(max_gap_arg)
         return {chrom: fixed for chrom in chroms}
+
+
+def fill_small_gaps(is_high, max_gap, segment_id):
+    """Set to True every run of at most `max_gap` non-high bins that has a high
+    bin on both sides within the same segment. Gaps longer than max_gap, and
+    gaps that span a hard break, are left as they are.
+
+    (This replaces scipy binary_closing with iterations=max_gap, which bridged
+    gaps of up to 2*max_gap bins and could erode runs at the array edges.)"""
+    closed = is_high.copy()
+    if max_gap <= 0:
+        return closed
+    idx = np.flatnonzero(is_high)
+    if len(idx) < 2:
+        return closed
+    for a, b in zip(idx[:-1], idx[1:]):
+        gap = b - a - 1
+        if 0 < gap <= max_gap and segment_id[a] == segment_id[b]:
+            closed[a + 1:b] = True
+    return closed
 
 
 def cluster_bins(df, max_gap_by_chrom, min_cluster_size):
@@ -361,15 +389,10 @@ def cluster_bins(df, max_gap_by_chrom, min_cluster_size):
 
         is_high = sub["is_high"].to_numpy()
 
-        if max_gap > 0 and len(is_high) > 2:
-            closed = binary_closing(
-                is_high, structure=np.ones(3, dtype=bool), iterations=max_gap
-            )
-        else:
-            closed = is_high.copy()
-
         hard_break_arr = hard_break.to_numpy()
         segment_id = np.cumsum(hard_break_arr)
+
+        closed = fill_small_gaps(is_high, max_gap, segment_id)
 
         run_break = (~closed) | (np.diff(np.concatenate(([segment_id[0]], segment_id))) != 0)
         local_cluster = np.cumsum(run_break)
@@ -389,24 +412,25 @@ def cluster_bins(df, max_gap_by_chrom, min_cluster_size):
         return pd.DataFrame(
             columns=[
                 "chrom", "start", "end", "n_bins", "n_high_bins",
-                "mean_value", "max_value", "mean_smoothed",
+                "mean_value", "max_value", "mean_smoothed", "mean_cn", "max_cn",
             ]
         ), df
 
-    agg = (
-        clustered.groupby("cluster_id")
-        .agg(
-            chrom=("chrom", "first"),
-            start=("start", "min"),
-            end=("start", "max"),
-            n_bins=("start", "size"),
-            n_high_bins=("is_high", "sum"),
-            mean_value=("value_raw", "mean"),
-            max_value=("value_raw", "max"),
-            mean_smoothed=("smoothed", "mean"),
-        )
-        .reset_index(drop=True)
+    aggs = dict(
+        chrom=("chrom", "first"),
+        start=("start", "min"),
+        end=("start", "max"),
+        n_bins=("start", "size"),
+        n_high_bins=("is_high", "sum"),
+        mean_value=("value_raw", "mean"),
+        max_value=("value_raw", "max"),
+        mean_smoothed=("smoothed", "mean"),
     )
+    if "cn_like" in clustered.columns:
+        # cn_like = smoothed value / genome-wide mean (1.0 = sample-average depth)
+        aggs["mean_cn"] = ("cn_like", "mean")
+        aggs["max_cn"] = ("cn_like", "max")
+    agg = clustered.groupby("cluster_id").agg(**aggs).reset_index(drop=True)
     agg = agg[agg["n_bins"] >= min_cluster_size]
     agg = agg.sort_values(["chrom", "start"]).reset_index(drop=True)
     return agg, df
@@ -618,6 +642,13 @@ def main():
                         "the signal's autocorrelation stays significant (default: 1)")
     p.add_argument("--max-gap-search-lags", type=int, default=20,
                    help="Max lag (in bins) to search when --max-gap auto is used (default: 20)")
+    p.add_argument("--max-gap-cap", type=int, default=None,
+                   help="With --max-gap auto, never allow more than this many gap bins")
+    p.add_argument("--min-rel-cn", type=float, default=None,
+                   help="Absolute floor for the 'high' threshold, in relative copy number "
+                        "(smoothed value / genome-wide mean; 1.0 = sample average). The threshold "
+                        "becomes max(quantile threshold, this value). Applies with or without a "
+                        "WGS comparison. E.g. 3.0 keeps only bins at >= 3x the average depth.")
     p.add_argument("--min-cluster-size", type=int, default=2,
                    help="Minimum number of bins for a cluster to be reported (default: 2)")
     p.add_argument("--neighbor-gap-factor", type=float, default=1.5,
@@ -752,10 +783,16 @@ def main():
                 compare_wgs_threshold = float(args.cn_floor)
                 print(f"CN floor applied: WES/WGS q90 CN-like values fell below {args.cn_floor}; setting high threshold to {compare_wgs_threshold:.2f} CN")
 
-    if cn_floor_threshold is not None:
-        df, threshold = call_high_bins(df, args.quantile, cn_floor=cn_floor_threshold)
-    else:
-        df, threshold = call_high_bins(df, args.quantile)
+    floors = [f for f in (cn_floor_threshold, args.min_rel_cn) if f is not None]
+    if floors and "cn_like" not in df.columns:
+        floors = []
+    floor = max(floors) if floors else None
+    df, threshold = call_high_bins(df, args.quantile, cn_floor=floor)
+    quantile_threshold = float(df["cn_like" if "cn_like" in df.columns else "smoothed"]
+                               .quantile(args.quantile))
+    if floor is not None and threshold > quantile_threshold:
+        print(f"Threshold raised from quantile value {quantile_threshold:.3f} to floor {floor:.3f} "
+              f"(relative CN)")
 
     # Ensure masked bins are not considered 'high' after thresholding.
     if args.mask_regions is not None:
@@ -764,7 +801,8 @@ def main():
     print(f"'High' threshold (quantile {args.quantile}) on {value_for_threshold} values: {threshold:.4f}")
     print(f"Bins above threshold: {df['is_high'].sum()} / {len(df)}")
 
-    max_gap_by_chrom = resolve_max_gap(df, "value_raw", args.max_gap, args.max_gap_search_lags)
+    max_gap_by_chrom = resolve_max_gap(df, "value_raw", args.max_gap, args.max_gap_search_lags,
+                                       cap=args.max_gap_cap)
     if args.max_gap == "auto":
         gap_report = ", ".join(f"{c}={g}" for c, g in sorted(max_gap_by_chrom.items()))
         print(f"Auto-computed max-gap per chromosome (from autocorrelation decay): {gap_report}")
@@ -793,7 +831,11 @@ def main():
           f"Details saved to {morans_path}")
 
     plot_path = outdir / "genomic_track.png"
-    plot_genomic_track(df_annotated, clusters, "value_raw", threshold, plot_path)
+    # threshold is in relative-CN units when cn_like exists; convert to raw units for the plot
+    threshold_raw = (threshold * baseline
+                     if value_for_threshold == "cn_like" and np.isfinite(baseline) and baseline > 0
+                     else threshold)
+    plot_genomic_track(df_annotated, clusters, "value_raw", threshold_raw, plot_path)
     print(f"Genomic track plot saved to {plot_path}")
 
     summary_path = outdir / "summary.txt"
@@ -807,12 +849,17 @@ def main():
         f.write(f"Bins analyzed:         {len(df)}\n")
         f.write(f"Chromosomes/contigs:   {df['chrom'].nunique()}\n")
         f.write(f"Smoothing window:      {smooth_window} bins\n")
-        f.write(f"'High' threshold:      {threshold:.4f} (quantile {args.quantile} of smoothed values)\n")
+        f.write(f"'High' threshold:      {threshold:.4f} relative CN "
+                f"(quantile {args.quantile} value {quantile_threshold:.4f}"
+                + (f", floor {floor:.4f}" if floor is not None else "") + ")\n")
+        f.write(f"Bins above threshold:  {int(df['is_high'].sum())}\n")
         if args.max_gap == "auto":
             f.write(f"Max gap allowed:       auto (per chromosome, from ACF decay): "
                      f"{dict(sorted(max_gap_by_chrom.items()))}\n")
         else:
             f.write(f"Max gap allowed:       {args.max_gap} bin(s)\n")
+        if args.max_gap == "auto" and args.max_gap_cap is not None:
+            f.write(f"Max gap cap:           {args.max_gap_cap} bin(s)\n")
         f.write(f"Min cluster size:      {args.min_cluster_size} bins\n")
         f.write(f"Clusters found:        {len(clusters)}\n")
         if df["masked"].any():
